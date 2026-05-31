@@ -1,0 +1,8 @@
+pyTelegramBotAPI
+requests
+flask
+beautifulsoup4
+pymongo
+gunicorn
+
+dotenv
