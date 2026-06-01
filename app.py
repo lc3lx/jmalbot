@@ -50,6 +50,8 @@ INSTADDR_SESSIONHASH = os.getenv("INSTADDR_SESSIONHASH")
 INSTADDR_CSRF_TOKEN = os.getenv("INSTADDR_CSRF_TOKEN")
 INSTADDR_CSRF_SUBTOKEN = os.getenv("INSTADDR_CSRF_SUBTOKEN")
 INSTADDR_SYNC_CONFIRM = os.getenv("INSTADDR_SYNC_CONFIRM", "no")
+INSTADDR_SEARCH_BY_ACCOUNT = os.getenv("INSTADDR_SEARCH_BY_ACCOUNT", "no").strip().lower() in ("1", "true", "yes")
+INSTADDR_PAGE_COUNT = int(os.getenv("INSTADDR_PAGE_COUNT", "1"))
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
 
@@ -312,10 +314,21 @@ def extract_message_text(msg):
 
 def message_matches_account(account, msg, body_text):
     account = account.lower().strip()
-    header_text = " ".join(
-        decode_mime_header(msg.get(header, ""))
-        for header in ("To", "Delivered-To", "X-Original-To", "Envelope-To", "Cc")
-    ).lower()
+    header_values = []
+    for header in (
+        "To",
+        "Delivered-To",
+        "X-Original-To",
+        "Envelope-To",
+        "X-Envelope-To",
+        "Apparently-To",
+        "Cc",
+        "Bcc",
+        "Received",
+    ):
+        header_values.extend(msg.get_all(header, []))
+
+    header_text = " ".join(decode_mime_header(value) for value in header_values).lower()
     return account in body_text.lower() or account in header_text
 
 
@@ -375,29 +388,43 @@ def create_instaddr_session():
 
 def fetch_instaddr_messages(account):
     session, csrf_token, csrf_subtoken = create_instaddr_session()
-    params = {
-        "page": "0",
-        "q": account,
-        "nopost": "1",
-        "csrf_token_check": csrf_token,
-    }
-    if csrf_subtoken:
-        params["csrf_subtoken_check"] = csrf_subtoken
+    mail_ids = []
 
     print(f"🔎 InstAddr: بدء البحث للحساب {account}")
-    inbox_response = session.get(
-        f"{INSTADDR_BASE_URL}/recv._ajax.php",
-        params=params,
-        timeout=IMAP_TIMEOUT_SECONDS,
-    )
-    inbox_response.raise_for_status()
+    for page in range(max(INSTADDR_PAGE_COUNT, 1)):
+        params = {
+            "page": str(page),
+            "nopost": "1",
+            "csrf_token_check": csrf_token,
+        }
+        if INSTADDR_SEARCH_BY_ACCOUNT:
+            params["q"] = account
+        if csrf_subtoken:
+            params["csrf_subtoken_check"] = csrf_subtoken
 
-    soup = BeautifulSoup(inbox_response.text, "html.parser")
-    mail_ids = [
-        link["id"].replace("link_maildata_", "")
-        for link in soup.select('a[id^="link_maildata_"]')
-    ][:MAIL_SEARCH_LIMIT]
-    print(f"🔎 InstAddr: سيتم فحص {len(mail_ids)} رسالة.")
+        inbox_response = session.get(
+            f"{INSTADDR_BASE_URL}/recv._ajax.php",
+            params=params,
+            timeout=IMAP_TIMEOUT_SECONDS,
+        )
+        inbox_response.raise_for_status()
+
+        soup = BeautifulSoup(inbox_response.text, "html.parser")
+        page_mail_ids = [
+            link["id"].replace("link_maildata_", "")
+            for link in soup.select('a[id^="link_maildata_"]')
+        ]
+
+        for mail_id in page_mail_ids:
+            if mail_id not in mail_ids:
+                mail_ids.append(mail_id)
+            if len(mail_ids) >= MAIL_SEARCH_LIMIT:
+                break
+
+        if len(mail_ids) >= MAIL_SEARCH_LIMIT or not page_mail_ids:
+            break
+
+    print(f"🔎 InstAddr: سيتم فحص {len(mail_ids)} رسالة من الصندوق العام.")
 
     messages = []
     for mail_id in mail_ids:
