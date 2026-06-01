@@ -15,6 +15,7 @@ import socket
 from pymongo import MongoClient
 from bson import ObjectId  # لاستخدام ObjectId في الموافقة/الرفض
 from dotenv import load_dotenv
+import requests
 
 # ----------------------------------
 # إعدادات MongoDB
@@ -41,6 +42,13 @@ PASSWORD = os.getenv("PASSWORD")
 IMAP_SERVER = os.getenv("IMAP_SERVER")
 IMAP_TIMEOUT_SECONDS = int(os.getenv("IMAP_TIMEOUT_SECONDS", "20"))
 MAIL_SEARCH_LIMIT = int(os.getenv("MAIL_SEARCH_LIMIT", "10"))
+MAIL_PROVIDER = os.getenv("MAIL_PROVIDER", "imap").strip().lower()
+INSTADDR_BASE_URL = os.getenv("INSTADDR_BASE_URL", "https://m.kuku.lu").rstrip("/")
+INSTADDR_ACCOUNT_ID = os.getenv("INSTADDR_ACCOUNT_ID")
+INSTADDR_PASSWORD = os.getenv("INSTADDR_PASSWORD")
+INSTADDR_SESSIONHASH = os.getenv("INSTADDR_SESSIONHASH")
+INSTADDR_CSRF_TOKEN = os.getenv("INSTADDR_CSRF_TOKEN")
+INSTADDR_CSRF_SUBTOKEN = os.getenv("INSTADDR_CSRF_SUBTOKEN")
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
 
@@ -315,8 +323,158 @@ def subject_has_keyword(subject, keywords):
     return any(keyword.lower() in subject for keyword in keywords)
 
 
+def create_instaddr_session():
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0",
+        "Referer": f"{INSTADDR_BASE_URL}/en.php",
+    })
+
+    if INSTADDR_SESSIONHASH:
+        session.cookies.set("cookie_sessionhash", INSTADDR_SESSIONHASH, domain="m.kuku.lu")
+
+    response = session.get(f"{INSTADDR_BASE_URL}/en.php", timeout=IMAP_TIMEOUT_SECONDS)
+    response.raise_for_status()
+
+    csrf_token = INSTADDR_CSRF_TOKEN or session.cookies.get("cookie_csrf_token")
+    csrf_subtoken = INSTADDR_CSRF_SUBTOKEN
+
+    token_match = re.search(r"csrf_token_check=([A-Za-z0-9_-]+)", response.text)
+    subtoken_match = re.search(r"csrf_subtoken_check=([A-Za-z0-9_-]+)", response.text)
+    if not csrf_token and token_match:
+        csrf_token = token_match.group(1)
+    if not csrf_subtoken and subtoken_match:
+        csrf_subtoken = subtoken_match.group(1)
+
+    if INSTADDR_ACCOUNT_ID and INSTADDR_PASSWORD:
+        login_response = session.post(
+            f"{INSTADDR_BASE_URL}/index.php",
+            data={
+                "action": "checkLogin",
+                "confirmcode": "",
+                "nopost": "1",
+                "csrf_token_check": csrf_token or "",
+                "csrf_subtoken_check": csrf_subtoken or "",
+                "number": INSTADDR_ACCOUNT_ID,
+                "password": INSTADDR_PASSWORD,
+                "syncconfirm": "yes",
+            },
+            timeout=IMAP_TIMEOUT_SECONDS,
+        )
+        if not login_response.text.startswith("OK:"):
+            raise RuntimeError(f"فشل تسجيل دخول InstAddr: {login_response.text[:120]}")
+
+    if not csrf_token:
+        csrf_token = session.cookies.get("cookie_csrf_token")
+    if not csrf_token:
+        raise RuntimeError("تعذر جلب CSRF token من InstAddr.")
+
+    return session, csrf_token, csrf_subtoken
+
+
+def fetch_instaddr_messages(account):
+    session, csrf_token, csrf_subtoken = create_instaddr_session()
+    params = {
+        "page": "0",
+        "q": account,
+        "nopost": "1",
+        "csrf_token_check": csrf_token,
+    }
+    if csrf_subtoken:
+        params["csrf_subtoken_check"] = csrf_subtoken
+
+    print(f"🔎 InstAddr: بدء البحث للحساب {account}")
+    inbox_response = session.get(
+        f"{INSTADDR_BASE_URL}/recv._ajax.php",
+        params=params,
+        timeout=IMAP_TIMEOUT_SECONDS,
+    )
+    inbox_response.raise_for_status()
+
+    soup = BeautifulSoup(inbox_response.text, "html.parser")
+    mail_ids = [
+        link["id"].replace("link_maildata_", "")
+        for link in soup.select('a[id^="link_maildata_"]')
+    ][:MAIL_SEARCH_LIMIT]
+    print(f"🔎 InstAddr: سيتم فحص {len(mail_ids)} رسالة.")
+
+    messages = []
+    for mail_id in mail_ids:
+        mail_response = session.get(
+            f"{INSTADDR_BASE_URL}/datagen.php",
+            params={
+                "action": "downloadMailData",
+                "type": "recv",
+                "mailnum": mail_id,
+            },
+            timeout=IMAP_TIMEOUT_SECONDS,
+        )
+        if mail_response.status_code != 200 or not mail_response.content:
+            continue
+
+        msg = email.message_from_bytes(mail_response.content)
+        messages.append({
+            "id": mail_id,
+            "message": msg,
+            "subject": decode_mime_header(msg["Subject"]),
+            "body": extract_message_text(msg),
+        })
+
+    return messages
+
+
+def fetch_instaddr_with_link(account, subject_keywords, button_text):
+    try:
+        for item in fetch_instaddr_messages(account):
+            msg = item["message"]
+            if not subject_has_keyword(item["subject"], subject_keywords):
+                continue
+            if not message_matches_account(account, msg, item["body"]):
+                continue
+
+            parts = msg.walk() if msg.is_multipart() else [msg]
+            for part in parts:
+                if part.get_content_type() != "text/html":
+                    continue
+                payload = part.get_payload(decode=True)
+                if not payload:
+                    continue
+                charset = part.get_content_charset() or "utf-8"
+                html_content = payload.decode(charset, errors="ignore")
+                soup = BeautifulSoup(html_content, 'html.parser')
+                for a in soup.find_all('a', href=True):
+                    if button_text in a.get_text():
+                        return a['href']
+        return "طلبك غير موجود."
+    except Exception as e:
+        print(f"❌ خطأ InstAddr أثناء البحث عن الرابط: {e}")
+        return f"Error fetching InstAddr emails: {e}"
+
+
+def fetch_instaddr_with_code(account, subject_keywords):
+    try:
+        for item in fetch_instaddr_messages(account):
+            msg = item["message"]
+            if not subject_has_keyword(item["subject"], subject_keywords):
+                continue
+            if not message_matches_account(account, msg, item["body"]):
+                print(f"⚠️ InstAddr: عنوان مناسب لكن الحساب غير مطابق: {item['subject']}")
+                continue
+
+            code_match = re.search(r'\b\d{4,8}\b', item["body"])
+            if code_match:
+                return code_match.group(0)
+        return "طلبك غير موجود."
+    except Exception as e:
+        print(f"❌ خطأ InstAddr أثناء البحث عن الكود: {e}")
+        return f"Error fetching InstAddr emails: {e}"
+
+
 @retry_on_error
 def fetch_email_with_link(account, subject_keywords, button_text):
+    if MAIL_PROVIDER == "instaddr":
+        return fetch_instaddr_with_link(account, subject_keywords, button_text)
+
     if not retry_imap_connection():
         return "تعذر الاتصال بالبريد. تأكد من إعدادات EMAIL و PASSWORD و IMAP_SERVER."
     try:
@@ -364,6 +522,9 @@ def fetch_email_with_link(account, subject_keywords, button_text):
 
 @retry_on_error
 def fetch_email_with_code(account, subject_keywords):
+    if MAIL_PROVIDER == "instaddr":
+        return fetch_instaddr_with_code(account, subject_keywords)
+
     if not retry_imap_connection():
         return "تعذر الاتصال بالبريد. تأكد من إعدادات EMAIL و PASSWORD و IMAP_SERVER."
     try:
