@@ -9,6 +9,7 @@ from bs4 import BeautifulSoup
 import re
 import time
 import threading
+import socket
 
 # مكتبة MongoDB
 from pymongo import MongoClient
@@ -38,8 +39,25 @@ TOKEN = os.getenv("TOKEN")
 EMAIL = os.getenv("EMAIL")
 PASSWORD = os.getenv("PASSWORD")
 IMAP_SERVER = os.getenv("IMAP_SERVER")
+IMAP_TIMEOUT_SECONDS = int(os.getenv("IMAP_TIMEOUT_SECONDS", "20"))
+MAIL_SEARCH_LIMIT = int(os.getenv("MAIL_SEARCH_LIMIT", "10"))
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
+
+
+def open_imap_connection():
+    if not IMAP_SERVER:
+        raise RuntimeError("IMAP_SERVER غير مضبوط في ملف .env")
+    if not EMAIL or not PASSWORD:
+        raise RuntimeError("EMAIL أو PASSWORD غير مضبوطين في ملف .env")
+
+    socket.setdefaulttimeout(IMAP_TIMEOUT_SECONDS)
+    try:
+        conn = imaplib.IMAP4_SSL(IMAP_SERVER, timeout=IMAP_TIMEOUT_SECONDS)
+    except TypeError:
+        conn = imaplib.IMAP4_SSL(IMAP_SERVER)
+    conn.login(EMAIL, PASSWORD)
+    return conn
 
 
 def init_db():
@@ -203,9 +221,8 @@ def get_subscribers() -> list:
 # قاموس مؤقت في الذاكرة لتخزين الحساب المحدد لكل مستخدم
 user_accounts = {}
 
-# فتح اتصال البريد مرة واحدة
-mail = imaplib.IMAP4_SSL(IMAP_SERVER)
-mail.login(EMAIL, PASSWORD)
+# يتم فتح اتصال البريد عند كل طلب حتى لا يعلق اتصال قديم أو منتهي.
+mail = None
 
 # ----------------------------------
 # دوال مساعدة
@@ -218,14 +235,14 @@ def retry_imap_connection():
     global mail
     for attempt in range(3):
         try:
-            mail = imaplib.IMAP4_SSL(IMAP_SERVER)
-            mail.login(EMAIL, PASSWORD)
+            mail = open_imap_connection()
             print("✅ اتصال IMAP ناجح.")
-            return
+            return True
         except Exception as e:
             print(f"❌ فشل الاتصال (المحاولة {attempt + 1}): {e}")
             time.sleep(2)
     print("❌ فشل إعادة الاتصال بعد عدة محاولات.")
+    return False
 
 def retry_on_error(func):
     """ديكورتر لإعادة المحاولة عند حدوث خطأ في جلب الرسائل."""
@@ -245,13 +262,24 @@ def retry_on_error(func):
 
 @retry_on_error
 def fetch_email_with_link(account, subject_keywords, button_text):
-    retry_imap_connection()
+    if not retry_imap_connection():
+        return "تعذر الاتصال بالبريد. تأكد من إعدادات EMAIL و PASSWORD و IMAP_SERVER."
     try:
-        mail.select("inbox")
-        _, data = mail.search(None, 'ALL')
-        mail_ids = data[0].split()[-35:]
+        print(f"🔎 بدء البحث عن رابط للحساب: {account}")
+        status, _ = mail.select("inbox")
+        if status != "OK":
+            return "تعذر فتح صندوق الوارد."
+
+        status, data = mail.search(None, 'ALL')
+        if status != "OK" or not data or not data[0]:
+            return "لم يتم العثور على رسائل في صندوق الوارد."
+
+        mail_ids = data[0].split()[-MAIL_SEARCH_LIMIT:]
+        print(f"🔎 سيتم فحص {len(mail_ids)} رسالة.")
         for mail_id in reversed(mail_ids):
-            _, msg_data = mail.fetch(mail_id, "(RFC822)")
+            status, msg_data = mail.fetch(mail_id, "(RFC822)")
+            if status != "OK" or not msg_data or not isinstance(msg_data[0], tuple):
+                continue
             raw_email = msg_data[0][1]
             msg = email.message_from_bytes(raw_email)
 
@@ -270,17 +298,34 @@ def fetch_email_with_link(account, subject_keywords, button_text):
                                     return a['href']
         return "طلبك غير موجود."
     except Exception as e:
+        print(f"❌ خطأ أثناء البحث عن الرابط: {e}")
         return f"Error fetching emails: {e}"
+    finally:
+        try:
+            mail.logout()
+        except Exception:
+            pass
 
 @retry_on_error
 def fetch_email_with_code(account, subject_keywords):
-    retry_imap_connection()
+    if not retry_imap_connection():
+        return "تعذر الاتصال بالبريد. تأكد من إعدادات EMAIL و PASSWORD و IMAP_SERVER."
     try:
-        mail.select("inbox")
-        _, data = mail.search(None, 'ALL')
-        mail_ids = data[0].split()[-35:]
+        print(f"🔎 بدء البحث عن كود للحساب: {account}")
+        status, _ = mail.select("inbox")
+        if status != "OK":
+            return "تعذر فتح صندوق الوارد."
+
+        status, data = mail.search(None, 'ALL')
+        if status != "OK" or not data or not data[0]:
+            return "لم يتم العثور على رسائل في صندوق الوارد."
+
+        mail_ids = data[0].split()[-MAIL_SEARCH_LIMIT:]
+        print(f"🔎 سيتم فحص {len(mail_ids)} رسالة.")
         for mail_id in reversed(mail_ids):
-            _, msg_data = mail.fetch(mail_id, "(RFC822)")
+            status, msg_data = mail.fetch(mail_id, "(RFC822)")
+            if status != "OK" or not msg_data or not isinstance(msg_data[0], tuple):
+                continue
             raw_email = msg_data[0][1]
             msg = email.message_from_bytes(raw_email)
 
@@ -298,7 +343,13 @@ def fetch_email_with_code(account, subject_keywords):
                                 return code_match.group(0)
         return "طلبك غير موجود."
     except Exception as e:
+        print(f"❌ خطأ أثناء البحث عن الكود: {e}")
         return f"Error fetching emails: {e}"
+    finally:
+        try:
+            mail.logout()
+        except Exception:
+            pass
 
 # ----------------------------------
 # دالة لمعالجة الطلبات (Thread)
