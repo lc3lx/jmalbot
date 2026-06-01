@@ -260,6 +260,61 @@ def retry_on_error(func):
         return "Error: Failed after multiple retries."
     return wrapper
 
+
+def decode_mime_header(value):
+    if not value:
+        return ""
+
+    decoded_parts = []
+    for part, encoding in decode_header(value):
+        if isinstance(part, bytes):
+            for charset in (encoding, "utf-8", "windows-1256", "latin-1"):
+                if not charset:
+                    continue
+                try:
+                    decoded_parts.append(part.decode(charset, errors="ignore"))
+                    break
+                except LookupError:
+                    continue
+        else:
+            decoded_parts.append(str(part))
+    return "".join(decoded_parts)
+
+
+def extract_message_text(msg):
+    texts = []
+    parts = msg.walk() if msg.is_multipart() else [msg]
+    for part in parts:
+        content_type = part.get_content_type()
+        if content_type not in ("text/plain", "text/html"):
+            continue
+
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
+
+        charset = part.get_content_charset() or "utf-8"
+        text = payload.decode(charset, errors="ignore")
+        if content_type == "text/html":
+            text = BeautifulSoup(text, 'html.parser').get_text(" ")
+        texts.append(text)
+    return "\n".join(texts)
+
+
+def message_matches_account(account, msg, body_text):
+    account = account.lower().strip()
+    header_text = " ".join(
+        decode_mime_header(msg.get(header, ""))
+        for header in ("To", "Delivered-To", "X-Original-To", "Envelope-To", "Cc")
+    ).lower()
+    return account in body_text.lower() or account in header_text
+
+
+def subject_has_keyword(subject, keywords):
+    subject = subject.lower()
+    return any(keyword.lower() in subject for keyword in keywords)
+
+
 @retry_on_error
 def fetch_email_with_link(account, subject_keywords, button_text):
     if not retry_imap_connection():
@@ -283,19 +338,20 @@ def fetch_email_with_link(account, subject_keywords, button_text):
             raw_email = msg_data[0][1]
             msg = email.message_from_bytes(raw_email)
 
-            subject, encoding = decode_header(msg["Subject"])[0]
-            if isinstance(subject, bytes):
-                subject = subject.decode(encoding if encoding else "utf-8")
+            subject = decode_mime_header(msg["Subject"])
 
-            if any(keyword in subject for keyword in subject_keywords):
+            if subject_has_keyword(subject, subject_keywords):
+                body_text = extract_message_text(msg)
+                if not message_matches_account(account, msg, body_text):
+                    continue
+
                 for part in msg.walk():
                     if part.get_content_type() == "text/html":
                         html_content = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                        if account in html_content:
-                            soup = BeautifulSoup(html_content, 'html.parser')
-                            for a in soup.find_all('a', href=True):
-                                if button_text in a.get_text():
-                                    return a['href']
+                        soup = BeautifulSoup(html_content, 'html.parser')
+                        for a in soup.find_all('a', href=True):
+                            if button_text in a.get_text():
+                                return a['href']
         return "طلبك غير موجود."
     except Exception as e:
         print(f"❌ خطأ أثناء البحث عن الرابط: {e}")
@@ -329,18 +385,17 @@ def fetch_email_with_code(account, subject_keywords):
             raw_email = msg_data[0][1]
             msg = email.message_from_bytes(raw_email)
 
-            subject, encoding = decode_header(msg["Subject"])[0]
-            if isinstance(subject, bytes):
-                subject = subject.decode(encoding if encoding else "utf-8")
+            subject = decode_mime_header(msg["Subject"])
 
-            if any(keyword in subject for keyword in subject_keywords):
-                for part in msg.walk():
-                    if part.get_content_type() == "text/html":
-                        html_content = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                        if account in html_content:
-                            code_match = re.search(r'\b\d{4}\b', BeautifulSoup(html_content, 'html.parser').get_text())
-                            if code_match:
-                                return code_match.group(0)
+            if subject_has_keyword(subject, subject_keywords):
+                body_text = extract_message_text(msg)
+                if not message_matches_account(account, msg, body_text):
+                    print(f"⚠️ تم العثور على عنوان مناسب لكن الحساب غير مطابق: {subject}")
+                    continue
+
+                code_match = re.search(r'\b\d{4,8}\b', body_text)
+                if code_match:
+                    return code_match.group(0)
         return "طلبك غير موجود."
     except Exception as e:
         print(f"❌ خطأ أثناء البحث عن الكود: {e}")
@@ -362,7 +417,7 @@ def handle_request_async(chat_id, account, message_text):
     elif message_text == 'طلب استعادة كلمة المرور':
         response = fetch_email_with_link(account, ["إعادة تعيين كلمة المرور"], "إعادة تعيين كلمة المرور")
     elif message_text == 'طلب رمز تسجيل الدخول':
-        response = fetch_email_with_code(account, ["رمز تسجيل الدخول"])
+        response = fetch_email_with_code(account, ["رمز تسجيل الدخول", "login code", "sign in code", "sign-in code"])
     elif message_text == 'طلب رابط عضويتك معلقة':
         response = fetch_email_with_link(account, ["عضويتك في Netflix معلّقة"], "إضافة معلومات الدفع")
     else:
