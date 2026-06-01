@@ -49,6 +49,7 @@ INSTADDR_PASSWORD = os.getenv("INSTADDR_PASSWORD")
 INSTADDR_SESSIONHASH = os.getenv("INSTADDR_SESSIONHASH")
 INSTADDR_CSRF_TOKEN = os.getenv("INSTADDR_CSRF_TOKEN")
 INSTADDR_CSRF_SUBTOKEN = os.getenv("INSTADDR_CSRF_SUBTOKEN")
+INSTADDR_SYNC_CONFIRM = os.getenv("INSTADDR_SYNC_CONFIRM", "no")
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
 
@@ -357,7 +358,7 @@ def create_instaddr_session():
                 "csrf_subtoken_check": csrf_subtoken or "",
                 "number": INSTADDR_ACCOUNT_ID,
                 "password": INSTADDR_PASSWORD,
-                "syncconfirm": "yes",
+                "syncconfirm": INSTADDR_SYNC_CONFIRM,
             },
             timeout=IMAP_TIMEOUT_SECONDS,
         )
