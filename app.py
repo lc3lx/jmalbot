@@ -368,22 +368,37 @@ def create_instaddr_session():
         csrf_subtoken = subtoken_match.group(1)
 
     if INSTADDR_ACCOUNT_ID and INSTADDR_PASSWORD:
+        login_payload = {
+            "action": "checkLogin",
+            "confirmcode": "",
+            "nopost": "1",
+            "csrf_token_check": csrf_token or "",
+            "csrf_subtoken_check": csrf_subtoken or "",
+            "number": INSTADDR_ACCOUNT_ID,
+            "password": INSTADDR_PASSWORD,
+            "syncconfirm": INSTADDR_SYNC_CONFIRM,
+        }
         login_response = session.post(
             f"{INSTADDR_BASE_URL}/index.php",
-            data={
-                "action": "checkLogin",
-                "confirmcode": "",
-                "nopost": "1",
-                "csrf_token_check": csrf_token or "",
-                "csrf_subtoken_check": csrf_subtoken or "",
-                "number": INSTADDR_ACCOUNT_ID,
-                "password": INSTADDR_PASSWORD,
-                "syncconfirm": INSTADDR_SYNC_CONFIRM,
-            },
+            data=login_payload,
             timeout=IMAP_TIMEOUT_SECONDS,
         )
+
+        if not login_response.text.startswith("OK:") and INSTADDR_SYNC_CONFIRM == "no":
+            retry_payload = {**login_payload, "syncconfirm": "yes"}
+            retry_response = session.post(
+                f"{INSTADDR_BASE_URL}/index.php",
+                data=retry_payload,
+                timeout=IMAP_TIMEOUT_SECONDS,
+            )
+            if retry_response.text.startswith("OK:"):
+                login_response = retry_response
+            else:
+                print(f"❌ InstAddr login retry raw response: {retry_response.text!r}")
+
         if not login_response.text.startswith("OK:"):
-            raise RuntimeError(f"فشل تسجيل دخول InstAddr: {login_response.text[:120]}")
+            print(f"❌ InstAddr login raw response: {login_response.text!r}")
+            raise RuntimeError(f"فشل تسجيل دخول InstAddr: {login_response.text!r}")
         print("✅ InstAddr: تم تسجيل الدخول.")
 
     if not csrf_token:
