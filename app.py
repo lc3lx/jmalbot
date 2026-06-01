@@ -10,6 +10,7 @@ import re
 import time
 import threading
 import socket
+from urllib.parse import unquote
 
 # مكتبة MongoDB
 from pymongo import MongoClient
@@ -332,6 +333,12 @@ def message_matches_account(account, msg, body_text):
     return account in body_text.lower() or account in header_text
 
 
+def recipient_matches_account(account, recipient):
+    if not recipient:
+        return False
+    return account.lower().strip() in recipient.lower()
+
+
 def subject_has_keyword(subject, keywords):
     subject = subject.lower()
     return any(keyword.lower() in subject for keyword in keywords)
@@ -388,17 +395,16 @@ def create_instaddr_session():
 
 def fetch_instaddr_messages(account):
     session, csrf_token, csrf_subtoken = create_instaddr_session()
-    mail_ids = []
+    mail_items = []
 
     print(f"🔎 InstAddr: بدء البحث للحساب {account}")
     for page in range(max(INSTADDR_PAGE_COUNT, 1)):
         params = {
             "page": str(page),
+            "q": account if INSTADDR_SEARCH_BY_ACCOUNT else "",
             "nopost": "1",
             "csrf_token_check": csrf_token,
         }
-        if INSTADDR_SEARCH_BY_ACCOUNT:
-            params["q"] = account
         if csrf_subtoken:
             params["csrf_subtoken_check"] = csrf_subtoken
 
@@ -410,24 +416,48 @@ def fetch_instaddr_messages(account):
         inbox_response.raise_for_status()
 
         soup = BeautifulSoup(inbox_response.text, "html.parser")
-        page_mail_ids = [
-            link["id"].replace("link_maildata_", "")
-            for link in soup.select('a[id^="link_maildata_"]')
-        ]
+        page_items = []
+        for link in soup.select('a[id^="link_maildata_"]'):
+            mail_id = link["id"].replace("link_maildata_", "")
+            item = {
+                "id": mail_id,
+                "subject": "",
+                "to": "",
+                "from": "",
+            }
 
-        for mail_id in page_mail_ids:
-            if mail_id not in mail_ids:
-                mail_ids.append(mail_id)
-            if len(mail_ids) >= MAIL_SEARCH_LIMIT:
+            area = soup.select_one(f"#area_mail_{mail_id}")
+            if area:
+                item["subject"] = area.get_text(" ", strip=True)
+                script = area.find_next("script")
+                script_text = script.get_text(" ", strip=True) if script else ""
+                metadata_match = re.search(r"openMailData\([^,]+,\s*'([^']*)'", script_text)
+                if metadata_match:
+                    for part in metadata_match.group(1).split(";"):
+                        if "=" not in part:
+                            continue
+                        key, value = part.split("=", 1)
+                        if key in ("to", "from"):
+                            item[key] = unquote(value)
+
+            page_items.append(item)
+
+        for item in page_items:
+            if all(existing["id"] != item["id"] for existing in mail_items):
+                mail_items.append(item)
+            if len(mail_items) >= MAIL_SEARCH_LIMIT:
                 break
 
-        if len(mail_ids) >= MAIL_SEARCH_LIMIT or not page_mail_ids:
+        if len(mail_items) >= MAIL_SEARCH_LIMIT or not page_items:
+            if not page_items:
+                print(f"⚠️ InstAddr: الصفحة {page} رجعت بدون رسائل. مقتطف الرد: {inbox_response.text[:300]}")
             break
 
-    print(f"🔎 InstAddr: سيتم فحص {len(mail_ids)} رسالة من الصندوق العام.")
+    print(f"🔎 InstAddr: سيتم فحص {len(mail_items)} رسالة من الصندوق العام.")
 
     messages = []
-    for mail_id in mail_ids:
+    for item in mail_items:
+        mail_id = item["id"]
         mail_response = session.get(
             f"{INSTADDR_BASE_URL}/datagen.php",
             params={
@@ -444,8 +474,10 @@ def fetch_instaddr_messages(account):
         messages.append({
             "id": mail_id,
             "message": msg,
-            "subject": decode_mime_header(msg["Subject"]),
+            "subject": decode_mime_header(msg["Subject"]) or item["subject"],
             "body": extract_message_text(msg),
+            "to": item["to"],
+            "from": item["from"],
         })
 
     return messages
@@ -457,7 +489,7 @@ def fetch_instaddr_with_link(account, subject_keywords, button_text):
             msg = item["message"]
             if not subject_has_keyword(item["subject"], subject_keywords):
                 continue
-            if not message_matches_account(account, msg, item["body"]):
+            if not recipient_matches_account(account, item["to"]) and not message_matches_account(account, msg, item["body"]):
                 continue
 
             parts = msg.walk() if msg.is_multipart() else [msg]
@@ -485,8 +517,8 @@ def fetch_instaddr_with_code(account, subject_keywords):
             msg = item["message"]
             if not subject_has_keyword(item["subject"], subject_keywords):
                 continue
-            if not message_matches_account(account, msg, item["body"]):
-                print(f"⚠️ InstAddr: عنوان مناسب لكن الحساب غير مطابق: {item['subject']}")
+            if not recipient_matches_account(account, item["to"]) and not message_matches_account(account, msg, item["body"]):
+                print(f"⚠️ InstAddr: عنوان مناسب لكن الحساب غير مطابق: {item['subject']} -> {item['to']}")
                 continue
 
             code_match = re.search(r'\b\d{4,8}\b', item["body"])
