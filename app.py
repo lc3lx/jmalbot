@@ -352,7 +352,7 @@ def create_instaddr_session():
     })
 
     if INSTADDR_SESSIONHASH:
-        session.cookies.set("cookie_sessionhash", INSTADDR_SESSIONHASH, domain="m.kuku.lu")
+        session.cookies.set("cookie_sessionhash", INSTADDR_SESSIONHASH, domain=".m.kuku.lu")
 
     response = session.get(f"{INSTADDR_BASE_URL}/en.php", timeout=IMAP_TIMEOUT_SECONDS)
     response.raise_for_status()
@@ -384,6 +384,7 @@ def create_instaddr_session():
         )
         if not login_response.text.startswith("OK:"):
             raise RuntimeError(f"فشل تسجيل دخول InstAddr: {login_response.text[:120]}")
+        print("✅ InstAddr: تم تسجيل الدخول.")
 
     if not csrf_token:
         csrf_token = session.cookies.get("cookie_csrf_token")
@@ -393,11 +394,31 @@ def create_instaddr_session():
     return session, csrf_token, csrf_subtoken
 
 
+def log_instaddr_addr_list(session):
+    try:
+        response = session.get(
+            f"{INSTADDR_BASE_URL}/datagen.php",
+            params={"action": "getAddrList"},
+            timeout=IMAP_TIMEOUT_SECONDS,
+        )
+        lines = [line for line in response.text.strip().splitlines() if line.strip()]
+        addresses = []
+        for line in lines[1:]:
+            first_value = line.replace('"', "").split(",", 1)[0].strip()
+            if "@" in first_value:
+                addresses.append(first_value)
+        sample = ", ".join(addresses[:5])
+        print(f"🔎 InstAddr: عدد العناوين بالحساب {len(addresses)}. أمثلة: {sample}")
+    except Exception as e:
+        print(f"⚠️ InstAddr: تعذر جلب قائمة العناوين: {e}")
+
+
 def fetch_instaddr_messages(account):
     session, csrf_token, csrf_subtoken = create_instaddr_session()
     mail_items = []
 
     print(f"🔎 InstAddr: بدء البحث للحساب {account}")
+    log_instaddr_addr_list(session)
     for page in range(max(INSTADDR_PAGE_COUNT, 1)):
         params = {
             "page": str(page),
@@ -450,7 +471,8 @@ def fetch_instaddr_messages(account):
 
         if len(mail_items) >= MAIL_SEARCH_LIMIT or not page_items:
             if not page_items:
-                print(f"⚠️ InstAddr: الصفحة {page} رجعت بدون رسائل. مقتطف الرد: {inbox_response.text[:300]}")
+                snippet = inbox_response.text[:800].replace("\n", " ")
+                print(f"⚠️ InstAddr: الصفحة {page} رجعت بدون رسائل. status={inbox_response.status_code} len={len(inbox_response.text)} مقتطف الرد: {snippet}")
             break
 
     print(f"🔎 InstAddr: سيتم فحص {len(mail_items)} رسالة من الصندوق العام.")
