@@ -10,13 +10,11 @@ import re
 import time
 import threading
 import socket
-from urllib.parse import unquote
 
 # مكتبة MongoDB
 from pymongo import MongoClient
 from bson import ObjectId  # لاستخدام ObjectId في الموافقة/الرفض
 from dotenv import load_dotenv
-import requests
 
 # ----------------------------------
 # إعدادات MongoDB
@@ -38,37 +36,28 @@ purchase_requests_coll = db["purchase_requests"]
 # إعداد البوت و Flask
 # ----------------------------------
 TOKEN = os.getenv("TOKEN")
-EMAIL = os.getenv("EMAIL")
-PASSWORD = os.getenv("PASSWORD")
-IMAP_SERVER = os.getenv("IMAP_SERVER")
+GMAIL_EMAIL = os.getenv("GMAIL_EMAIL") or os.getenv("EMAIL")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD") or os.getenv("PASSWORD")
+IMAP_SERVER = os.getenv("IMAP_SERVER", "imap.gmail.com")
 IMAP_TIMEOUT_SECONDS = int(os.getenv("IMAP_TIMEOUT_SECONDS", "20"))
-MAIL_SEARCH_LIMIT = int(os.getenv("MAIL_SEARCH_LIMIT", "10"))
-MAIL_PROVIDER = os.getenv("MAIL_PROVIDER", "imap").strip().lower()
-INSTADDR_BASE_URL = os.getenv("INSTADDR_BASE_URL", "https://m.kuku.lu").rstrip("/")
-INSTADDR_ACCOUNT_ID = os.getenv("INSTADDR_ACCOUNT_ID")
-INSTADDR_PASSWORD = os.getenv("INSTADDR_PASSWORD")
-INSTADDR_SESSIONHASH = os.getenv("INSTADDR_SESSIONHASH")
-INSTADDR_CSRF_TOKEN = os.getenv("INSTADDR_CSRF_TOKEN")
-INSTADDR_CSRF_SUBTOKEN = os.getenv("INSTADDR_CSRF_SUBTOKEN")
-INSTADDR_SYNC_CONFIRM = os.getenv("INSTADDR_SYNC_CONFIRM", "no")
-INSTADDR_SEARCH_BY_ACCOUNT = os.getenv("INSTADDR_SEARCH_BY_ACCOUNT", "no").strip().lower() in ("1", "true", "yes")
-INSTADDR_PAGE_COUNT = int(os.getenv("INSTADDR_PAGE_COUNT", "1"))
+MAIL_SEARCH_LIMIT = int(os.getenv("MAIL_SEARCH_LIMIT", "20"))
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
 
 
-def open_imap_connection():
-    if not IMAP_SERVER:
-        raise RuntimeError("IMAP_SERVER غير مضبوط في ملف .env")
-    if not EMAIL or not PASSWORD:
-        raise RuntimeError("EMAIL أو PASSWORD غير مضبوطين في ملف .env")
+def open_gmail_connection():
+    if not GMAIL_EMAIL or not GMAIL_APP_PASSWORD:
+        raise RuntimeError(
+            "GMAIL_EMAIL و GMAIL_APP_PASSWORD غير مضبوطين في ملف .env. "
+            "استخدم كلمة مرور تطبيق من حساب Google."
+        )
 
     socket.setdefaulttimeout(IMAP_TIMEOUT_SECONDS)
     try:
         conn = imaplib.IMAP4_SSL(IMAP_SERVER, timeout=IMAP_TIMEOUT_SECONDS)
     except TypeError:
         conn = imaplib.IMAP4_SSL(IMAP_SERVER)
-    conn.login(EMAIL, PASSWORD)
+    conn.login(GMAIL_EMAIL, GMAIL_APP_PASSWORD)
     return conn
 
 
@@ -243,17 +232,17 @@ mail = None
 def clean_text(text):
     return text.strip()
 
-def retry_imap_connection():
+def retry_gmail_connection():
     global mail
     for attempt in range(3):
         try:
-            mail = open_imap_connection()
-            print("✅ اتصال IMAP ناجح.")
+            mail = open_gmail_connection()
+            print("✅ اتصال Gmail IMAP ناجح.")
             return True
         except Exception as e:
-            print(f"❌ فشل الاتصال (المحاولة {attempt + 1}): {e}")
+            print(f"❌ فشل الاتصال بـ Gmail (المحاولة {attempt + 1}): {e}")
             time.sleep(2)
-    print("❌ فشل إعادة الاتصال بعد عدة محاولات.")
+    print("❌ فشل إعادة الاتصال بـ Gmail بعد عدة محاولات.")
     return False
 
 def retry_on_error(func):
@@ -333,331 +322,122 @@ def message_matches_account(account, msg, body_text):
     return account in body_text.lower() or account in header_text
 
 
-def recipient_matches_account(account, recipient):
-    if not recipient:
-        return False
-    return account.lower().strip() in recipient.lower()
-
-
 def subject_has_keyword(subject, keywords):
     subject = subject.lower()
     return any(keyword.lower() in subject for keyword in keywords)
 
 
-def create_instaddr_session():
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0",
-        "Referer": f"{INSTADDR_BASE_URL}/en.php",
-    })
-
-    if INSTADDR_SESSIONHASH:
-        session.cookies.set("cookie_sessionhash", INSTADDR_SESSIONHASH, domain=".m.kuku.lu")
-
-    response = session.get(f"{INSTADDR_BASE_URL}/en.php", timeout=IMAP_TIMEOUT_SECONDS)
-    response.raise_for_status()
-
-    csrf_token = INSTADDR_CSRF_TOKEN or session.cookies.get("cookie_csrf_token")
-    csrf_subtoken = INSTADDR_CSRF_SUBTOKEN
-
-    token_match = re.search(r"csrf_token_check=([A-Za-z0-9_-]+)", response.text)
-    subtoken_match = re.search(r"csrf_subtoken_check=([A-Za-z0-9_-]+)", response.text)
-    if not csrf_token and token_match:
-        csrf_token = token_match.group(1)
-    if not csrf_subtoken and subtoken_match:
-        csrf_subtoken = subtoken_match.group(1)
-
-    if INSTADDR_ACCOUNT_ID and INSTADDR_PASSWORD:
-        login_payload = {
-            "action": "checkLogin",
-            "confirmcode": "",
-            "nopost": "1",
-            "csrf_token_check": csrf_token or "",
-            "csrf_subtoken_check": csrf_subtoken or "",
-            "number": INSTADDR_ACCOUNT_ID,
-            "password": INSTADDR_PASSWORD,
-            "syncconfirm": INSTADDR_SYNC_CONFIRM,
-        }
-        login_response = session.post(
-            f"{INSTADDR_BASE_URL}/index.php",
-            data=login_payload,
-            timeout=IMAP_TIMEOUT_SECONDS,
-        )
-
-        if not login_response.text.startswith("OK:") and INSTADDR_SYNC_CONFIRM == "no":
-            retry_payload = {**login_payload, "syncconfirm": "yes"}
-            retry_response = session.post(
-                f"{INSTADDR_BASE_URL}/index.php",
-                data=retry_payload,
-                timeout=IMAP_TIMEOUT_SECONDS,
-            )
-            if retry_response.text.startswith("OK:"):
-                login_response = retry_response
-            else:
-                print(f"❌ InstAddr login retry raw response: {retry_response.text!r}")
-
-        if not login_response.text.startswith("OK:"):
-            print(f"❌ InstAddr login raw response: {login_response.text!r}")
-            raise RuntimeError(f"فشل تسجيل دخول InstAddr: {login_response.text!r}")
-        print("✅ InstAddr: تم تسجيل الدخول.")
-
-    if not csrf_token:
-        csrf_token = session.cookies.get("cookie_csrf_token")
-    if not csrf_token:
-        raise RuntimeError("تعذر جلب CSRF token من InstAddr.")
-
-    return session, csrf_token, csrf_subtoken
+def build_gmail_search_query(account, subject_keywords=None):
+    account = account.strip()
+    query_parts = [f'to:{account}']
+    if subject_keywords:
+        subject_query = " OR ".join(f'subject:"{keyword}"' for keyword in subject_keywords)
+        query_parts.append(f"({subject_query})")
+    return " ".join(query_parts)
 
 
-def log_instaddr_addr_list(session):
-    try:
-        response = session.get(
-            f"{INSTADDR_BASE_URL}/datagen.php",
-            params={"action": "getAddrList"},
-            timeout=IMAP_TIMEOUT_SECONDS,
-        )
-        lines = [line for line in response.text.strip().splitlines() if line.strip()]
-        addresses = []
-        for line in lines[1:]:
-            first_value = line.replace('"', "").split(",", 1)[0].strip()
-            if "@" in first_value:
-                addresses.append(first_value)
-        sample = ", ".join(addresses[:5])
-        print(f"🔎 InstAddr: عدد العناوين بالحساب {len(addresses)}. أمثلة: {sample}")
-    except Exception as e:
-        print(f"⚠️ InstAddr: تعذر جلب قائمة العناوين: {e}")
+def search_gmail_messages(account, subject_keywords=None):
+    status, _ = mail.select("INBOX")
+    if status != "OK":
+        raise RuntimeError("تعذر فتح صندوق الوارد في Gmail.")
+
+    search_query = build_gmail_search_query(account, subject_keywords)
+    print(f"🔎 Gmail search: {search_query}")
+
+    status, data = mail.search(None, "X-GM-RAW", search_query)
+    if status != "OK" or not data or not data[0]:
+        status, data = mail.search(None, "TO", f'"{account}"')
+        if status != "OK" or not data or not data[0]:
+            return []
+
+    mail_ids = data[0].split()[-MAIL_SEARCH_LIMIT:]
+    print(f"🔎 سيتم فحص {len(mail_ids)} رسالة من Gmail.")
+    return list(reversed(mail_ids))
 
 
-def fetch_instaddr_messages(account):
-    session, csrf_token, csrf_subtoken = create_instaddr_session()
-    mail_items = []
+def fetch_gmail_message(mail_id):
+    status, msg_data = mail.fetch(mail_id, "(RFC822)")
+    if status != "OK" or not msg_data or not isinstance(msg_data[0], tuple):
+        return None
+    return email.message_from_bytes(msg_data[0][1])
 
-    print(f"🔎 InstAddr: بدء البحث للحساب {account}")
-    log_instaddr_addr_list(session)
-    for page in range(max(INSTADDR_PAGE_COUNT, 1)):
-        params = {
-            "page": str(page),
-            "q": account if INSTADDR_SEARCH_BY_ACCOUNT else "",
-            "nopost": "1",
-            "csrf_token_check": csrf_token,
-        }
-        if csrf_subtoken:
-            params["csrf_subtoken_check"] = csrf_subtoken
 
-        inbox_response = session.get(
-            f"{INSTADDR_BASE_URL}/recv._ajax.php",
-            params=params,
-            timeout=IMAP_TIMEOUT_SECONDS,
-        )
-        inbox_response.raise_for_status()
-
-        soup = BeautifulSoup(inbox_response.text, "html.parser")
-        page_items = []
-        for link in soup.select('a[id^="link_maildata_"]'):
-            mail_id = link["id"].replace("link_maildata_", "")
-            item = {
-                "id": mail_id,
-                "subject": "",
-                "to": "",
-                "from": "",
-            }
-
-            area = soup.select_one(f"#area_mail_{mail_id}")
-            if area:
-                item["subject"] = area.get_text(" ", strip=True)
-                script = area.find_next("script")
-                script_text = script.get_text(" ", strip=True) if script else ""
-                metadata_match = re.search(r"openMailData\([^,]+,\s*'([^']*)'", script_text)
-                if metadata_match:
-                    for part in metadata_match.group(1).split(";"):
-                        if "=" not in part:
-                            continue
-                        key, value = part.split("=", 1)
-                        if key in ("to", "from"):
-                            item[key] = unquote(value)
-
-            page_items.append(item)
-
-        for item in page_items:
-            if all(existing["id"] != item["id"] for existing in mail_items):
-                mail_items.append(item)
-            if len(mail_items) >= MAIL_SEARCH_LIMIT:
-                break
-
-        if len(mail_items) >= MAIL_SEARCH_LIMIT or not page_items:
-            if not page_items:
-                snippet = inbox_response.text[:800].replace("\n", " ")
-                print(f"⚠️ InstAddr: الصفحة {page} رجعت بدون رسائل. status={inbox_response.status_code} len={len(inbox_response.text)} مقتطف الرد: {snippet}")
-            break
-
-    print(f"🔎 InstAddr: سيتم فحص {len(mail_items)} رسالة من الصندوق العام.")
-
-    messages = []
-    for item in mail_items:
-        mail_id = item["id"]
-        mail_response = session.get(
-            f"{INSTADDR_BASE_URL}/datagen.php",
-            params={
-                "action": "downloadMailData",
-                "type": "recv",
-                "mailnum": mail_id,
-            },
-            timeout=IMAP_TIMEOUT_SECONDS,
-        )
-        if mail_response.status_code != 200 or not mail_response.content:
+def extract_link_from_message(msg, button_text):
+    for part in msg.walk():
+        if part.get_content_type() != "text/html":
             continue
-
-        msg = email.message_from_bytes(mail_response.content)
-        messages.append({
-            "id": mail_id,
-            "message": msg,
-            "subject": decode_mime_header(msg["Subject"]) or item["subject"],
-            "body": extract_message_text(msg),
-            "to": item["to"],
-            "from": item["from"],
-        })
-
-    return messages
-
-
-def fetch_instaddr_with_link(account, subject_keywords, button_text):
-    try:
-        for item in fetch_instaddr_messages(account):
-            msg = item["message"]
-            if not subject_has_keyword(item["subject"], subject_keywords):
-                continue
-            if not recipient_matches_account(account, item["to"]) and not message_matches_account(account, msg, item["body"]):
-                continue
-
-            parts = msg.walk() if msg.is_multipart() else [msg]
-            for part in parts:
-                if part.get_content_type() != "text/html":
-                    continue
-                payload = part.get_payload(decode=True)
-                if not payload:
-                    continue
-                charset = part.get_content_charset() or "utf-8"
-                html_content = payload.decode(charset, errors="ignore")
-                soup = BeautifulSoup(html_content, 'html.parser')
-                for a in soup.find_all('a', href=True):
-                    if button_text in a.get_text():
-                        return a['href']
-        return "طلبك غير موجود."
-    except Exception as e:
-        print(f"❌ خطأ InstAddr أثناء البحث عن الرابط: {e}")
-        return f"Error fetching InstAddr emails: {e}"
-
-
-def fetch_instaddr_with_code(account, subject_keywords):
-    try:
-        for item in fetch_instaddr_messages(account):
-            msg = item["message"]
-            if not subject_has_keyword(item["subject"], subject_keywords):
-                continue
-            if not recipient_matches_account(account, item["to"]) and not message_matches_account(account, msg, item["body"]):
-                print(f"⚠️ InstAddr: عنوان مناسب لكن الحساب غير مطابق: {item['subject']} -> {item['to']}")
-                continue
-
-            code_match = re.search(r'\b\d{4,8}\b', item["body"])
-            if code_match:
-                return code_match.group(0)
-        return "طلبك غير موجود."
-    except Exception as e:
-        print(f"❌ خطأ InstAddr أثناء البحث عن الكود: {e}")
-        return f"Error fetching InstAddr emails: {e}"
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
+        charset = part.get_content_charset() or "utf-8"
+        html_content = payload.decode(charset, errors="ignore")
+        soup = BeautifulSoup(html_content, "html.parser")
+        for anchor in soup.find_all("a", href=True):
+            if button_text in anchor.get_text():
+                return anchor["href"]
+    return None
 
 
 @retry_on_error
 def fetch_email_with_link(account, subject_keywords, button_text):
-    if MAIL_PROVIDER == "instaddr":
-        return fetch_instaddr_with_link(account, subject_keywords, button_text)
-
-    if not retry_imap_connection():
-        return "تعذر الاتصال بالبريد. تأكد من إعدادات EMAIL و PASSWORD و IMAP_SERVER."
+    if not retry_gmail_connection():
+        return "تعذر الاتصال بـ Gmail. تأكد من GMAIL_EMAIL و GMAIL_APP_PASSWORD."
     try:
         print(f"🔎 بدء البحث عن رابط للحساب: {account}")
-        status, _ = mail.select("inbox")
-        if status != "OK":
-            return "تعذر فتح صندوق الوارد."
-
-        status, data = mail.search(None, 'ALL')
-        if status != "OK" or not data or not data[0]:
-            return "لم يتم العثور على رسائل في صندوق الوارد."
-
-        mail_ids = data[0].split()[-MAIL_SEARCH_LIMIT:]
-        print(f"🔎 سيتم فحص {len(mail_ids)} رسالة.")
-        for mail_id in reversed(mail_ids):
-            status, msg_data = mail.fetch(mail_id, "(RFC822)")
-            if status != "OK" or not msg_data or not isinstance(msg_data[0], tuple):
+        for mail_id in search_gmail_messages(account, subject_keywords):
+            msg = fetch_gmail_message(mail_id)
+            if not msg:
                 continue
-            raw_email = msg_data[0][1]
-            msg = email.message_from_bytes(raw_email)
 
             subject = decode_mime_header(msg["Subject"])
+            if not subject_has_keyword(subject, subject_keywords):
+                continue
 
-            if subject_has_keyword(subject, subject_keywords):
-                body_text = extract_message_text(msg)
-                if not message_matches_account(account, msg, body_text):
-                    continue
+            body_text = extract_message_text(msg)
+            if not message_matches_account(account, msg, body_text):
+                continue
 
-                for part in msg.walk():
-                    if part.get_content_type() == "text/html":
-                        html_content = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                        soup = BeautifulSoup(html_content, 'html.parser')
-                        for a in soup.find_all('a', href=True):
-                            if button_text in a.get_text():
-                                return a['href']
+            link = extract_link_from_message(msg, button_text)
+            if link:
+                return link
         return "طلبك غير موجود."
     except Exception as e:
-        print(f"❌ خطأ أثناء البحث عن الرابط: {e}")
-        return f"Error fetching emails: {e}"
+        print(f"❌ خطأ أثناء البحث عن الرابط في Gmail: {e}")
+        return f"Error fetching Gmail emails: {e}"
     finally:
         try:
             mail.logout()
         except Exception:
             pass
 
+
 @retry_on_error
 def fetch_email_with_code(account, subject_keywords):
-    if MAIL_PROVIDER == "instaddr":
-        return fetch_instaddr_with_code(account, subject_keywords)
-
-    if not retry_imap_connection():
-        return "تعذر الاتصال بالبريد. تأكد من إعدادات EMAIL و PASSWORD و IMAP_SERVER."
+    if not retry_gmail_connection():
+        return "تعذر الاتصال بـ Gmail. تأكد من GMAIL_EMAIL و GMAIL_APP_PASSWORD."
     try:
         print(f"🔎 بدء البحث عن كود للحساب: {account}")
-        status, _ = mail.select("inbox")
-        if status != "OK":
-            return "تعذر فتح صندوق الوارد."
-
-        status, data = mail.search(None, 'ALL')
-        if status != "OK" or not data or not data[0]:
-            return "لم يتم العثور على رسائل في صندوق الوارد."
-
-        mail_ids = data[0].split()[-MAIL_SEARCH_LIMIT:]
-        print(f"🔎 سيتم فحص {len(mail_ids)} رسالة.")
-        for mail_id in reversed(mail_ids):
-            status, msg_data = mail.fetch(mail_id, "(RFC822)")
-            if status != "OK" or not msg_data or not isinstance(msg_data[0], tuple):
+        for mail_id in search_gmail_messages(account, subject_keywords):
+            msg = fetch_gmail_message(mail_id)
+            if not msg:
                 continue
-            raw_email = msg_data[0][1]
-            msg = email.message_from_bytes(raw_email)
 
             subject = decode_mime_header(msg["Subject"])
+            if not subject_has_keyword(subject, subject_keywords):
+                continue
 
-            if subject_has_keyword(subject, subject_keywords):
-                body_text = extract_message_text(msg)
-                if not message_matches_account(account, msg, body_text):
-                    print(f"⚠️ تم العثور على عنوان مناسب لكن الحساب غير مطابق: {subject}")
-                    continue
+            body_text = extract_message_text(msg)
+            if not message_matches_account(account, msg, body_text):
+                print(f"⚠️ عنوان مناسب لكن الحساب غير مطابق: {subject}")
+                continue
 
-                code_match = re.search(r'\b\d{4,8}\b', body_text)
-                if code_match:
-                    return code_match.group(0)
+            code_match = re.search(r"\b\d{4,8}\b", body_text)
+            if code_match:
+                return code_match.group(0)
         return "طلبك غير موجود."
     except Exception as e:
-        print(f"❌ خطأ أثناء البحث عن الكود: {e}")
-        return f"Error fetching emails: {e}"
+        print(f"❌ خطأ أثناء البحث عن الكود في Gmail: {e}")
+        return f"Error fetching Gmail emails: {e}"
     finally:
         try:
             mail.logout()
