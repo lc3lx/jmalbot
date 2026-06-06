@@ -327,42 +327,25 @@ def subject_has_keyword(subject, keywords):
     return any(keyword.lower() in subject for keyword in keywords)
 
 
-def is_ascii_text(value):
-    try:
-        value.encode("ascii")
-        return True
-    except UnicodeEncodeError:
-        return False
-
-
-def build_gmail_search_query(account, subject_keywords=None):
-    account = account.strip()
-    query_parts = [f"to:{account}"]
-    ascii_keywords = [kw for kw in (subject_keywords or []) if is_ascii_text(kw)]
-    if ascii_keywords:
-        subject_query = " OR ".join(f'subject:"{keyword}"' for keyword in ascii_keywords)
-        query_parts.append(f"({subject_query})")
-    return " ".join(query_parts)
-
-
-def run_gmail_search(search_query, account):
-    try:
-        return mail.search(None, "X-GM-RAW", search_query)
-    except (UnicodeEncodeError, UnicodeError):
-        print(f"⚠️ Gmail: إعادة البحث بدون كلمات عربية: to:{account}")
-        return mail.search(None, "X-GM-RAW", f"to:{account}")
-
-
 def search_gmail_messages(account, subject_keywords=None):
+    account = account.strip()
     status, _ = mail.select("INBOX")
     if status != "OK":
         raise RuntimeError("تعذر فتح صندوق الوارد في Gmail.")
 
-    search_query = build_gmail_search_query(account, subject_keywords)
-    print(f"🔎 Gmail search: {search_query}")
+    data = None
+    for query in (f"to:{account}", f"deliveredto:{account}"):
+        print(f"🔎 Gmail search: {query}")
+        try:
+            status, data = mail.search(None, "X-GM-RAW", query)
+            if status == "OK" and data and data[0]:
+                break
+        except Exception as e:
+            print(f"⚠️ Gmail X-GM-RAW فشل لـ {query}: {e}")
+            data = None
 
-    status, data = run_gmail_search(search_query, account)
-    if status != "OK" or not data or not data[0]:
+    if not data or not data[0]:
+        print(f"🔎 Gmail fallback search: TO {account}")
         status, data = mail.search(None, "TO", account)
         if status != "OK" or not data or not data[0]:
             return []
