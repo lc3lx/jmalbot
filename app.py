@@ -41,6 +41,7 @@ GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD") or os.getenv("PASSWORD")
 IMAP_SERVER = os.getenv("IMAP_SERVER", "imap.gmail.com")
 IMAP_TIMEOUT_SECONDS = int(os.getenv("IMAP_TIMEOUT_SECONDS", "20"))
 MAIL_SEARCH_LIMIT = int(os.getenv("MAIL_SEARCH_LIMIT", "20"))
+INITIAL_ADMIN = (os.getenv("INITIAL_ADMIN") or "").strip().lstrip("@")
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
 
@@ -69,6 +70,8 @@ def init_db():
     users_coll.create_index("username", unique=True)
     accounts_for_sale_coll.create_index("account")
     subscribers_coll.create_index("chat_id", unique=True)
+    if INITIAL_ADMIN:
+        add_admin(INITIAL_ADMIN)
     # لا بأس من ترك purchase_requests بدون unique إذا كل طلب مختلف
 
 # ========== دوال خاصة بالأدمن ==========
@@ -230,7 +233,15 @@ mail = None
 # ----------------------------------
 
 def clean_text(text):
-    return text.strip()
+    if not text:
+        return ""
+    return str(text).strip()
+
+
+def get_telegram_username(user) -> str:
+    if not user or not user.username:
+        return ""
+    return clean_text(user.username).lstrip("@")
 
 def retry_gmail_connection():
     global mail
@@ -468,7 +479,13 @@ def handle_request_async(chat_id, account, message_text):
 # ----------------------------------
 @bot.message_handler(commands=['start'])
 def start_message(message):
-    telegram_username = clean_text(message.from_user.username)
+    telegram_username = get_telegram_username(message.from_user)
+    if not telegram_username:
+        return bot.send_message(
+            message.chat.id,
+            "❌ حسابك بدون username في تليجرام.\n"
+            "فعّل اسم المستخدم من: الإعدادات → اسم المستخدم"
+        )
     create_user_if_not_exists(telegram_username)
 
     user_accounts_list = get_allowed_accounts(telegram_username)
@@ -738,23 +755,94 @@ def process_admin_show_user_accounts(message):
         bot.send_message(message.chat.id, resp)
 
 # ----------------------------------
+# إضافة مستخدم جديد
+# ----------------------------------
+@bot.message_handler(func=lambda message: message.text == "إضافة مستخدم جديد")
+def add_new_user_start(message):
+    user_name = get_telegram_username(message.from_user)
+    if not is_admin(user_name):
+        return bot.send_message(message.chat.id, "❌ أنت لست أدمن.")
+    bot.send_message(
+        message.chat.id,
+        "📝 أرسل username المستخدم في تليجرام (بدون @):\n"
+        "مثال: jwdxp1"
+    )
+    bot.register_next_step_handler(message, process_add_new_user_step1)
+
+
+def process_add_new_user_step1(message):
+    username = clean_text(message.text).lstrip("@")
+    if not username:
+        return bot.send_message(message.chat.id, "❌ اسم المستخدم غير صالح.")
+    create_user_if_not_exists(username)
+    bot.send_message(
+        message.chat.id,
+        f"✅ تم إنشاء المستخدم @{username}.\n\n"
+        "📝 أرسل الحسابات المراد ربطها (حساب في كل سطر).\n"
+        "أو اكتب: تخطي"
+    )
+    bot.register_next_step_handler(message, process_add_new_user_step2, username)
+
+
+def process_add_new_user_step2(message, username):
+    if clean_text(message.text).lower() in ("تخطي", "skip", "-"):
+        return bot.send_message(
+            message.chat.id,
+            f"✅ المستخدم @{username} جاهز.\n"
+            "يمكنك لاحقاً إضافة حسابات عبر «إضافة حسابات لمستخدم»."
+        )
+
+    accounts_to_add = [acc.strip() for acc in message.text.strip().split("\n") if acc.strip()]
+    if not accounts_to_add:
+        return bot.send_message(message.chat.id, "❌ لم يتم إرسال أي حساب.")
+
+    for acc in accounts_to_add:
+        add_allowed_user_account(username, acc)
+    bot.send_message(
+        message.chat.id,
+        f"✅ تم إنشاء المستخدم @{username} وربط {len(accounts_to_add)} حساب/حسابات."
+    )
+
+
+# ----------------------------------
 # إضافة مشترك
 # ----------------------------------
 @bot.message_handler(func=lambda message: message.text == "إضافة مشترك")
 def add_subscriber_handler(message):
-    user_name = message.from_user.username
+    user_name = get_telegram_username(message.from_user)
     if not is_admin(user_name):
         return bot.send_message(message.chat.id, "❌ أنت لست أدمن.")
-    bot.send_message(message.chat.id, "📝 الرجاء إدخال الـ Chat ID المراد إضافته للمشتركين:")
+    bot.send_message(
+        message.chat.id,
+        "📝 أرسل Chat ID رقمي (ليس @username).\n\n"
+        "📌 كيف تجيب الـ Chat ID:\n"
+        "• من لوج البوت عند إرسال /start (chat.id)\n"
+        "• أو من بوت @userinfobot\n\n"
+        "مثال: 1760682664"
+    )
     bot.register_next_step_handler(message, process_subscriber_id)
 
+
 def process_subscriber_id(message):
+    text = clean_text(message.text)
+    if text.startswith("@"):
+        return bot.send_message(
+            message.chat.id,
+            "❌ المشترك يحتاج Chat ID رقمي وليس username.\n"
+            "استخدم @userinfobot أو شوف chat.id في لوج البوت."
+        )
     try:
-        chat_id_to_add = int(message.text.strip())
+        chat_id_to_add = int(text)
         add_subscriber(chat_id_to_add)
-        bot.send_message(message.chat.id, f"✅ تم إضافة المشترك {chat_id_to_add} بنجاح إلى قائمة المشتركين.")
+        bot.send_message(
+            message.chat.id,
+            f"✅ تم إضافة المشترك {chat_id_to_add} بنجاح إلى قائمة المشتركين."
+        )
     except ValueError:
-        bot.send_message(message.chat.id, "❌ الرجاء إدخال رقم صحيح للـ Chat ID.")
+        bot.send_message(
+            message.chat.id,
+            "❌ الرجاء إدخال رقم صحيح للـ Chat ID.\nمثال: 1760682664"
+        )
 
 # ----------------------------------
 # زر عرض عدد المستخدمين
