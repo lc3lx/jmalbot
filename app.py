@@ -2,6 +2,7 @@ import telebot
 from telebot import types
 from flask import Flask, request
 import os
+import sys
 import imaplib
 import email
 from email.header import decode_header
@@ -15,6 +16,24 @@ import socket
 from pymongo import MongoClient
 from bson import ObjectId  # لاستخدام ObjectId في الموافقة/الرفض
 from dotenv import load_dotenv
+
+# منع أخطاء ascii عند طباعة العربية في بيئات بدون UTF-8
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+
+def safe_print(*args, **kwargs):
+    try:
+        print(*args, **kwargs)
+    except UnicodeEncodeError:
+        try:
+            text = " ".join(str(a) for a in args)
+            print(text.encode("utf-8", errors="replace").decode("ascii", errors="replace"), **kwargs)
+        except Exception:
+            pass
 
 # ----------------------------------
 # إعدادات MongoDB
@@ -248,12 +267,12 @@ def retry_gmail_connection():
     for attempt in range(3):
         try:
             mail = open_gmail_connection()
-            print("✅ اتصال Gmail IMAP ناجح.")
+            safe_print("✅ اتصال Gmail IMAP ناجح.")
             return True
         except Exception as e:
-            print(f"❌ فشل الاتصال بـ Gmail (المحاولة {attempt + 1}): {e}")
+            safe_print(f"❌ فشل الاتصال بـ Gmail (المحاولة {attempt + 1}): {e}")
             time.sleep(2)
-    print("❌ فشل إعادة الاتصال بـ Gmail بعد عدة محاولات.")
+    safe_print("❌ فشل إعادة الاتصال بـ Gmail بعد عدة محاولات.")
     return False
 
 def retry_on_error(func):
@@ -342,27 +361,27 @@ def search_gmail_messages(account, subject_keywords=None):
     account = account.strip()
     status, _ = mail.select("INBOX")
     if status != "OK":
-        raise RuntimeError("تعذر فتح صندوق الوارد في Gmail.")
+        raise RuntimeError("Failed to open Gmail INBOX.")
 
     data = None
     for query in (f"to:{account}", f"deliveredto:{account}"):
-        print(f"🔎 Gmail search: {query}")
+        safe_print(f"Gmail search: {query}")
         try:
             status, data = mail.search(None, "X-GM-RAW", query)
             if status == "OK" and data and data[0]:
                 break
         except Exception as e:
-            print(f"⚠️ Gmail X-GM-RAW فشل لـ {query}: {e}")
+            safe_print(f"Gmail X-GM-RAW failed for {query}: {e}")
             data = None
 
     if not data or not data[0]:
-        print(f"🔎 Gmail fallback search: TO {account}")
+        safe_print(f"Gmail fallback search: TO {account}")
         status, data = mail.search(None, "TO", account)
         if status != "OK" or not data or not data[0]:
             return []
 
     mail_ids = data[0].split()[-MAIL_SEARCH_LIMIT:]
-    print(f"🔎 سيتم فحص {len(mail_ids)} رسالة من Gmail.")
+    safe_print(f"Inspecting {len(mail_ids)} Gmail messages.")
     return list(reversed(mail_ids))
 
 
@@ -394,7 +413,7 @@ def fetch_email_with_link(account, subject_keywords, button_text):
     if not retry_gmail_connection():
         return "تعذر الاتصال بـ Gmail. تأكد من GMAIL_EMAIL و GMAIL_APP_PASSWORD."
     try:
-        print(f"🔎 بدء البحث عن رابط للحساب: {account}")
+        safe_print(f"Searching link for account: {account}")
         for mail_id in search_gmail_messages(account, subject_keywords):
             msg = fetch_gmail_message(mail_id)
             if not msg:
@@ -413,7 +432,7 @@ def fetch_email_with_link(account, subject_keywords, button_text):
                 return link
         return "طلبك غير موجود."
     except Exception as e:
-        print(f"❌ خطأ أثناء البحث عن الرابط في Gmail: {e}")
+        safe_print(f"Error while searching Gmail link: {e}")
         return f"Error fetching Gmail emails: {e}"
     finally:
         try:
@@ -427,7 +446,7 @@ def fetch_email_with_code(account, subject_keywords):
     if not retry_gmail_connection():
         return "تعذر الاتصال بـ Gmail. تأكد من GMAIL_EMAIL و GMAIL_APP_PASSWORD."
     try:
-        print(f"🔎 بدء البحث عن كود للحساب: {account}")
+        safe_print(f"Searching code for account: {account}")
         for mail_id in search_gmail_messages(account, subject_keywords):
             msg = fetch_gmail_message(mail_id)
             if not msg:
@@ -439,7 +458,7 @@ def fetch_email_with_code(account, subject_keywords):
 
             body_text = extract_message_text(msg)
             if not message_matches_account(account, msg, body_text):
-                print(f"⚠️ عنوان مناسب لكن الحساب غير مطابق: {subject}")
+                safe_print(f"Subject matched but account mismatch: {subject}")
                 continue
 
             code_match = re.search(r"\b\d{4,8}\b", body_text)
@@ -447,7 +466,7 @@ def fetch_email_with_code(account, subject_keywords):
                 return code_match.group(0)
         return "طلبك غير موجود."
     except Exception as e:
-        print(f"❌ خطأ أثناء البحث عن الكود في Gmail: {e}")
+        safe_print(f"Error while searching Gmail code: {e}")
         return f"Error fetching Gmail emails: {e}"
     finally:
         try:
@@ -475,6 +494,8 @@ def handle_request_async(chat_id, account, message_text):
             "confirmation code",
             "sign-in code",
             "sign in code",
+            "netflix verification",
+            "تنتهي صلاحيته",
         ])
     elif message_text == 'طلب رابط عضويتك معلقة':
         response = fetch_email_with_link(account, ["عضويتك في Netflix معلّقة"], "إضافة معلومات الدفع")
