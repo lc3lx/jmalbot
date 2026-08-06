@@ -526,6 +526,7 @@ def process_account_name(message):
         # الأزرار الإضافية للأدمن
         if is_admin(user_name):
             btns.extend([
+                types.KeyboardButton('طلب رمز التأكيد'),
                 types.KeyboardButton('طلب رمز تسجيل الدخول'),
                 types.KeyboardButton('طلب رابط عضويتك معلقة'),
                 types.KeyboardButton('إضافة حسابات للبيع'),
