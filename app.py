@@ -26,14 +26,23 @@ except Exception:
 
 
 def safe_print(*args, **kwargs):
+    text = " ".join(str(a) for a in args)
     try:
-        print(*args, **kwargs)
-    except UnicodeEncodeError:
+        print(text, **kwargs)
+        return
+    except Exception:
+        pass
+    try:
+        sys.stdout.buffer.write(text.encode("utf-8", errors="replace") + b"\n")
+    except Exception:
         try:
-            text = " ".join(str(a) for a in args)
-            print(text.encode("utf-8", errors="replace").decode("ascii", errors="replace"), **kwargs)
+            print(text.encode("ascii", errors="replace").decode("ascii"), **kwargs)
         except Exception:
             pass
+
+
+def ascii_error(e):
+    return f"{type(e).__name__}: {e}".encode("ascii", errors="replace").decode("ascii")
 
 # ----------------------------------
 # إعدادات MongoDB
@@ -68,8 +77,8 @@ app = Flask(__name__)
 def open_gmail_connection():
     if not GMAIL_EMAIL or not GMAIL_APP_PASSWORD:
         raise RuntimeError(
-            "GMAIL_EMAIL و GMAIL_APP_PASSWORD غير مضبوطين في ملف .env. "
-            "استخدم كلمة مرور تطبيق من حساب Google."
+            "GMAIL_EMAIL and GMAIL_APP_PASSWORD are not set in .env. "
+            "Use a Google App Password."
         )
 
     socket.setdefaulttimeout(IMAP_TIMEOUT_SECONDS)
@@ -78,6 +87,10 @@ def open_gmail_connection():
     except TypeError:
         conn = imaplib.IMAP4_SSL(IMAP_SERVER)
     conn.login(GMAIL_EMAIL, GMAIL_APP_PASSWORD)
+    try:
+        conn.enable("UTF8=ACCEPT")
+    except Exception:
+        pass
     return conn
 
 
@@ -267,12 +280,12 @@ def retry_gmail_connection():
     for attempt in range(3):
         try:
             mail = open_gmail_connection()
-            safe_print("✅ اتصال Gmail IMAP ناجح.")
+            safe_print("Gmail IMAP connected.")
             return True
         except Exception as e:
-            safe_print(f"❌ فشل الاتصال بـ Gmail (المحاولة {attempt + 1}): {e}")
+            safe_print(f"Gmail connect failed (attempt {attempt + 1}): {ascii_error(e)}")
             time.sleep(2)
-    safe_print("❌ فشل إعادة الاتصال بـ Gmail بعد عدة محاولات.")
+    safe_print("Gmail reconnect failed after retries.")
     return False
 
 def retry_on_error(func):
@@ -324,12 +337,62 @@ def extract_message_text(msg):
         if not payload:
             continue
 
-        charset = part.get_content_charset() or "utf-8"
-        text = payload.decode(charset, errors="ignore")
+        # دائماً utf-8 أولاً لتجنب مشاكل charset=ascii مع محتوى عربي
+        text = payload.decode("utf-8", errors="ignore")
+        if not text.strip():
+            charset = part.get_content_charset() or "utf-8"
+            try:
+                text = payload.decode(charset, errors="ignore")
+            except Exception:
+                text = payload.decode("latin-1", errors="ignore")
+
         if content_type == "text/html":
-            text = BeautifulSoup(text, 'html.parser').get_text(" ")
+            try:
+                text = BeautifulSoup(text, "html.parser").get_text(" ")
+            except Exception:
+                text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", text)
+                text = re.sub(r"(?s)<[^>]+>", " ", text)
+                text = re.sub(r"&\w+;", " ", text)
         texts.append(text)
     return "\n".join(texts)
+
+
+def extract_message_text_plain(msg):
+    """استخراج نص الإيميل بدون BeautifulSoup (مسار آمن لرموز التحقق)."""
+    texts = []
+    parts = msg.walk() if msg.is_multipart() else [msg]
+    for part in parts:
+        content_type = part.get_content_type()
+        if content_type not in ("text/plain", "text/html"):
+            continue
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
+        text = payload.decode("utf-8", errors="ignore")
+        if content_type == "text/html":
+            text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", text)
+            text = re.sub(r"(?s)<[^>]+>", " ", text)
+            text = re.sub(r"&nbsp;", " ", text, flags=re.I)
+            text = re.sub(r"&#(\d+);", lambda m: chr(int(m.group(1))) if int(m.group(1)) < 0x110000 else " ", text)
+            text = re.sub(r"&\w+;", " ", text)
+        texts.append(text)
+    return "\n".join(texts)
+
+
+def extract_verification_code(body_text):
+    if not body_text:
+        return None
+
+    # كود متصل: 181079
+    match = re.search(r"(?<!\d)(\d{4,8})(?!\d)", body_text)
+    if match:
+        return match.group(1)
+
+    # كود بمسافات بين الأرقام: 1 8 1 0 7 9
+    spaced = re.search(r"(?<!\d)(?:\d(?:[ \t\u00a0]+)){3,7}\d(?!\d)", body_text)
+    if spaced:
+        return re.sub(r"\D", "", spaced.group(0))
+    return None
 
 
 def message_matches_account(account, msg, body_text):
@@ -349,16 +412,20 @@ def message_matches_account(account, msg, body_text):
         header_values.extend(msg.get_all(header, []))
 
     header_text = " ".join(decode_mime_header(value) for value in header_values).lower()
-    return account in body_text.lower() or account in header_text
+    body_lower = body_text.lower() if isinstance(body_text, str) else ""
+    return account in body_lower or account in header_text
 
 
 def subject_has_keyword(subject, keywords):
-    subject = subject.lower()
-    return any(keyword.lower() in subject for keyword in keywords)
+    subject = (subject or "").lower()
+    return any((keyword or "").lower() in subject for keyword in keywords)
 
 
 def search_gmail_messages(account, subject_keywords=None):
-    account = account.strip()
+    account = (account or "").strip().encode("ascii", errors="ignore").decode("ascii").strip()
+    if not account:
+        return []
+
     status, _ = mail.select("INBOX")
     if status != "OK":
         raise RuntimeError("Failed to open Gmail INBOX.")
@@ -367,16 +434,17 @@ def search_gmail_messages(account, subject_keywords=None):
     for query in (f"to:{account}", f"deliveredto:{account}"):
         safe_print(f"Gmail search: {query}")
         try:
-            status, data = mail.search(None, "X-GM-RAW", query)
+            # تمرير bytes يمنع UnicodeEncodeError داخل imaplib
+            status, data = mail.search(None, b"X-GM-RAW", query.encode("ascii"))
             if status == "OK" and data and data[0]:
                 break
         except Exception as e:
-            safe_print(f"Gmail X-GM-RAW failed for {query}: {e}")
+            safe_print(f"Gmail X-GM-RAW failed for {query}: {ascii_error(e)}")
             data = None
 
     if not data or not data[0]:
         safe_print(f"Gmail fallback search: TO {account}")
-        status, data = mail.search(None, "TO", account)
+        status, data = mail.search(None, b"TO", account.encode("ascii"))
         if status != "OK" or not data or not data[0]:
             return []
 
@@ -386,7 +454,7 @@ def search_gmail_messages(account, subject_keywords=None):
 
 
 def fetch_gmail_message(mail_id):
-    status, msg_data = mail.fetch(mail_id, "(RFC822)")
+    status, msg_data = mail.fetch(mail_id, b"(RFC822)")
     if status != "OK" or not msg_data or not isinstance(msg_data[0], tuple):
         return None
     return email.message_from_bytes(msg_data[0][1])
@@ -399,9 +467,11 @@ def extract_link_from_message(msg, button_text):
         payload = part.get_payload(decode=True)
         if not payload:
             continue
-        charset = part.get_content_charset() or "utf-8"
-        html_content = payload.decode(charset, errors="ignore")
-        soup = BeautifulSoup(html_content, "html.parser")
+        html_content = payload.decode("utf-8", errors="ignore")
+        try:
+            soup = BeautifulSoup(html_content, "html.parser")
+        except Exception:
+            continue
         for anchor in soup.find_all("a", href=True):
             if button_text in anchor.get_text():
                 return anchor["href"]
@@ -432,8 +502,8 @@ def fetch_email_with_link(account, subject_keywords, button_text):
                 return link
         return "طلبك غير موجود."
     except Exception as e:
-        safe_print(f"Error while searching Gmail link: {e}")
-        return f"Error fetching Gmail emails: {e}"
+        safe_print(f"Error while searching Gmail link: {ascii_error(e)}")
+        return f"Error fetching Gmail emails: {ascii_error(e)}"
     finally:
         try:
             mail.logout()
@@ -452,22 +522,25 @@ def fetch_email_with_code(account, subject_keywords):
             if not msg:
                 continue
 
-            subject = decode_mime_header(msg["Subject"])
+            subject = decode_mime_header(msg.get("Subject"))
             if not subject_has_keyword(subject, subject_keywords):
                 continue
 
-            body_text = extract_message_text(msg)
+            # بدون BeautifulSoup لتجنب أخطاء ascii مع إيميلات Netflix العربية
+            body_text = extract_message_text_plain(msg)
             if not message_matches_account(account, msg, body_text):
-                safe_print(f"Subject matched but account mismatch: {subject}")
+                safe_print("Subject matched but account mismatch")
                 continue
 
-            code_match = re.search(r"\b\d{4,8}\b", body_text)
-            if code_match:
-                return code_match.group(0)
+            code = extract_verification_code(body_text)
+            if code:
+                return code
         return "طلبك غير موجود."
     except Exception as e:
-        safe_print(f"Error while searching Gmail code: {e}")
-        return f"Error fetching Gmail emails: {e}"
+        import traceback
+        tb_tail = traceback.format_exc()[-400:].encode("ascii", errors="replace").decode("ascii")
+        safe_print(f"Error while searching Gmail code: {ascii_error(e)}")
+        return f"Error fetching Gmail emails: {ascii_error(e)} | {tb_tail}"
     finally:
         try:
             mail.logout()
