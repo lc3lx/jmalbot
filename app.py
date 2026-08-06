@@ -513,7 +513,7 @@ def process_account_name(message):
         user_accounts[user_name] = account_name
 
         markup = types.ReplyKeyboardMarkup(row_width=1)
-        # أزرار عامة للمستخدم العادي
+        # أزرار عامة للمستخدم العادي والأدمن
         btns = [
             types.KeyboardButton('طلب رابط تحديث السكن'),
             types.KeyboardButton('طلب رمز السكن'),
