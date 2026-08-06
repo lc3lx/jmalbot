@@ -467,6 +467,15 @@ def handle_request_async(chat_id, account, message_text):
         response = fetch_email_with_link(account, ["إعادة تعيين كلمة المرور"], "إعادة تعيين كلمة المرور")
     elif message_text == 'طلب رمز تسجيل الدخول':
         response = fetch_email_with_code(account, ["رمز تسجيل الدخول", "login code", "sign in code", "sign-in code"])
+    elif message_text == 'طلب رمز التأكيد':
+        response = fetch_email_with_code(account, [
+            "رمز التحقق",
+            "رمز التأكيد",
+            "verification code",
+            "confirmation code",
+            "sign-in code",
+            "sign in code",
+        ])
     elif message_text == 'طلب رابط عضويتك معلقة':
         response = fetch_email_with_link(account, ["عضويتك في Netflix معلّقة"], "إضافة معلومات الدفع")
     else:
@@ -508,6 +517,7 @@ def process_account_name(message):
         btns = [
             types.KeyboardButton('طلب رابط تحديث السكن'),
             types.KeyboardButton('طلب رمز السكن'),
+            types.KeyboardButton('طلب رمز التأكيد'),
             types.KeyboardButton('طلب استعادة كلمة المرور'),
             types.KeyboardButton('عرض الحسابات المرتبطة بي'),
             # زر شراء حسابات (يطلب موافقة الأدمن)
@@ -542,6 +552,7 @@ def process_account_name(message):
 @bot.message_handler(func=lambda message: message.text in [
     'طلب رابط تحديث السكن',
     'طلب رمز السكن',
+    'طلب رمز التأكيد',
     'طلب استعادة كلمة المرور',
     'طلب رمز تسجيل الدخول',
     'طلب رابط عضويتك معلقة'
