@@ -261,6 +261,25 @@ user_accounts = {}
 mail = None
 
 # ----------------------------------
+# تخزين مؤقت للرموز والروابط لتسريع الاستجابة ومنع تكرار البحث
+# ----------------------------------
+recent_code_cache = {}
+CACHE_TTL = 20  # ثانية
+
+def get_cached_result(account, req_type):
+    key = (str(account).lower().strip(), str(req_type))
+    if key in recent_code_cache:
+        val, ts = recent_code_cache[key]
+        if time.time() - ts < CACHE_TTL and val and val != "طلبك غير موجود.":
+            return val
+    return None
+
+def set_cached_result(account, req_type, result):
+    if result and result != "طلبك غير موجود." and not str(result).startswith("Error"):
+        key = (str(account).lower().strip(), str(req_type))
+        recent_code_cache[key] = (result, time.time())
+
+# ----------------------------------
 # دوال مساعدة
 # ----------------------------------
 
@@ -379,20 +398,57 @@ def extract_message_text_plain(msg):
     return "\n".join(texts)
 
 
-def extract_verification_code(body_text):
+def extract_code_from_body(body_text, code_length=None):
     if not body_text:
         return None
 
-    # كود متصل: 181079
+    if code_length == 6:
+        # كود 6 أرقام مفصول بمسافات: 1 8 1 0 7 9
+        spaced = re.search(r"(?<!\d)(?:\d[ \t\u00a0]+){5}\d(?!\d)", body_text)
+        if spaced:
+            return re.sub(r"\D", "", spaced.group(0))
+        # كود 6 أرقام متصل
+        matches = re.findall(r"(?<!\d)(\d{6})(?!\d)", body_text)
+        if matches:
+            return matches[0]
+
+    if code_length == 4:
+        # كود 4 أرقام متصل أو مفصول بمسافات مع استبعاد السنوات
+        spaced = re.search(r"(?<!\d)(?:\d[ \t\u00a0]+){3}\d(?!\d)", body_text)
+        if spaced:
+            c = re.sub(r"\D", "", spaced.group(0))
+            if c not in ("2023", "2024", "2025", "2026", "2027"):
+                return c
+        matches = re.findall(r"(?<!\d)(\d{4})(?!\d)", body_text)
+        for m in matches:
+            if m not in ("2023", "2024", "2025", "2026", "2027"):
+                return m
+
+    # في حال لم يحدد الطول أو لم نجد
+    matches_6 = re.findall(r"(?<!\d)(\d{6})(?!\d)", body_text)
+    if matches_6:
+        return matches_6[0]
+
+    matches_4 = re.findall(r"(?<!\d)(\d{4})(?!\d)", body_text)
+    for m in matches_4:
+        if m not in ("2023", "2024", "2025", "2026", "2027"):
+            return m
+
     match = re.search(r"(?<!\d)(\d{4,8})(?!\d)", body_text)
-    if match:
+    if match and match.group(1) not in ("2023", "2024", "2025", "2026", "2027"):
         return match.group(1)
 
-    # كود بمسافات بين الأرقام: 1 8 1 0 7 9
     spaced = re.search(r"(?<!\d)(?:\d(?:[ \t\u00a0]+)){3,7}\d(?!\d)", body_text)
     if spaced:
-        return re.sub(r"\D", "", spaced.group(0))
+        c = re.sub(r"\D", "", spaced.group(0))
+        if c not in ("2023", "2024", "2025", "2026", "2027"):
+            return c
+
     return None
+
+
+def extract_verification_code(body_text):
+    return extract_code_from_body(body_text)
 
 
 def message_matches_account(account, msg, body_text):
@@ -431,10 +487,12 @@ def search_gmail_messages(account, subject_keywords=None):
         raise RuntimeError("Failed to open Gmail INBOX.")
 
     data = None
-    for query in (f"to:{account}", f"deliveredto:{account}"):
+    account_clean = account.strip().lower()
+
+    # 1. البحث السريع في رسائل آخر يومين (أسرع بكثير)
+    for query in (f"to:{account_clean} newer_than:2d", f"deliveredto:{account_clean} newer_than:2d"):
         safe_print(f"Gmail search: {query}")
         try:
-            # تمرير bytes يمنع UnicodeEncodeError داخل imaplib
             status, data = mail.search(None, b"X-GM-RAW", query.encode("ascii"))
             if status == "OK" and data and data[0]:
                 break
@@ -442,6 +500,19 @@ def search_gmail_messages(account, subject_keywords=None):
             safe_print(f"Gmail X-GM-RAW failed for {query}: {ascii_error(e)}")
             data = None
 
+    # 2. في حال لم نجد رسائل حديثة، نبحث في كل الرسائل
+    if not data or not data[0]:
+        for query in (f"to:{account_clean}", f"deliveredto:{account_clean}"):
+            safe_print(f"Gmail search all: {query}")
+            try:
+                status, data = mail.search(None, b"X-GM-RAW", query.encode("ascii"))
+                if status == "OK" and data and data[0]:
+                    break
+            except Exception as e:
+                safe_print(f"Gmail search failed for {query}: {ascii_error(e)}")
+                data = None
+
+    # 3. خطة بديلة أخيرة
     if not data or not data[0]:
         safe_print(f"Gmail fallback search: TO {account}")
         status, data = mail.search(None, b"TO", account.encode("ascii"))
@@ -461,6 +532,7 @@ def fetch_gmail_message(mail_id):
 
 
 def extract_link_from_message(msg, button_text):
+    button_keywords = button_text if isinstance(button_text, (list, tuple)) else [button_text]
     for part in msg.walk():
         if part.get_content_type() != "text/html":
             continue
@@ -473,13 +545,69 @@ def extract_link_from_message(msg, button_text):
         except Exception:
             continue
         for anchor in soup.find_all("a", href=True):
-            if button_text in anchor.get_text():
+            txt = anchor.get_text().strip().lower()
+            if any(btn.lower() in txt for btn in button_keywords):
                 return anchor["href"]
+        for anchor in soup.find_all("a", href=True):
+            href = anchor["href"]
+            if "netflix.com" in href.lower() and any(kw in href.lower() for kw in ("nftoken", "password", "household", "travel", "code")):
+                return href
+    return None
+
+
+def extract_approval_link_from_message(msg, button_keywords=None):
+    if not msg:
+        return None
+    if not button_keywords:
+        button_keywords = [
+            "الموافقة على تسجيل الدخول",
+            "الموافقة",
+            "approve sign-in",
+            "approve sign in",
+            "approve"
+        ]
+    for part in msg.walk():
+        if part.get_content_type() != "text/html":
+            continue
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
+        html_content = payload.decode("utf-8", errors="ignore")
+        try:
+            soup = BeautifulSoup(html_content, "html.parser")
+        except Exception:
+            continue
+
+        # 1. البحث بنص الزر الصريح مع تجنب أزرار الرفض
+        for a in soup.find_all("a", href=True):
+            txt = a.get_text().strip().lower()
+            href = a["href"].lower()
+            if any(rej in txt for rej in ["رفض", "reject", "cancel", "deny"]):
+                continue
+            if any(rej in href for rej in ["reject", "cancel", "deny", "denied", "unsubscribe"]):
+                continue
+            if any(btn.lower() in txt for btn in button_keywords):
+                return a["href"]
+
+        # 2. خطة بديلة: البحث عن روابط netflix المخصصة للموافقة مع استبعاد الرفض
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            href_lower = href.lower()
+            if "netflix.com" in href_lower:
+                if any(rej in href_lower for rej in ["reject", "cancel", "deny", "denied", "unsubscribe", "help", "terms", "privacy"]):
+                    continue
+                if any(kw in href_lower for kw in ("nftoken", "confirm", "travel", "approve", "sign-in", "signin")):
+                    return href
     return None
 
 
 @retry_on_error
 def fetch_email_with_link(account, subject_keywords, button_text):
+    cache_tag = button_text[0] if isinstance(button_text, (list, tuple)) else button_text
+    cached = get_cached_result(account, f"link_{cache_tag}")
+    if cached:
+        return cached
+
     if not retry_gmail_connection():
         return "تعذر الاتصال بـ Gmail. تأكد من GMAIL_EMAIL و GMAIL_APP_PASSWORD."
     try:
@@ -489,7 +617,7 @@ def fetch_email_with_link(account, subject_keywords, button_text):
             if not msg:
                 continue
 
-            subject = decode_mime_header(msg["Subject"])
+            subject = decode_mime_header(msg.get("Subject", ""))
             if not subject_has_keyword(subject, subject_keywords):
                 continue
 
@@ -499,6 +627,7 @@ def fetch_email_with_link(account, subject_keywords, button_text):
 
             link = extract_link_from_message(msg, button_text)
             if link:
+                set_cached_result(account, f"link_{cache_tag}", link)
                 return link
         return "طلبك غير موجود."
     except Exception as e:
@@ -512,28 +641,84 @@ def fetch_email_with_link(account, subject_keywords, button_text):
 
 
 @retry_on_error
-def fetch_email_with_code(account, subject_keywords):
+def fetch_email_approval_link(account):
+    cached = get_cached_result(account, "approve_link")
+    if cached:
+        return cached
+
+    subject_keywords = [
+        "الموافقة على طلب تسجيل الدخول",
+        "طلب تسجيل الدخول الجديد",
+        "الموافقة على تسجيل الدخول الجديد",
+        "الموافقة على تسجيل الدخول",
+        "طلب تسجيل دخول جديد",
+        "موافقة على تسجيل الدخول",
+        "sign-in request",
+        "approve sign-in",
+        "approve sign in",
+        "new sign-in request",
+        "approve new sign-in"
+    ]
     if not retry_gmail_connection():
         return "تعذر الاتصال بـ Gmail. تأكد من GMAIL_EMAIL و GMAIL_APP_PASSWORD."
     try:
-        safe_print(f"Searching code for account: {account}")
+        safe_print(f"Searching approval link for account: {account}")
         for mail_id in search_gmail_messages(account, subject_keywords):
             msg = fetch_gmail_message(mail_id)
             if not msg:
                 continue
 
-            subject = decode_mime_header(msg.get("Subject"))
+            subject = decode_mime_header(msg.get("Subject", ""))
             if not subject_has_keyword(subject, subject_keywords):
                 continue
 
-            # بدون BeautifulSoup لتجنب أخطاء ascii مع إيميلات Netflix العربية
+            body_text = extract_message_text(msg)
+            if not message_matches_account(account, msg, body_text):
+                continue
+
+            link = extract_approval_link_from_message(msg)
+            if link:
+                set_cached_result(account, "approve_link", link)
+                return link
+        return "طلبك غير موجود."
+    except Exception as e:
+        safe_print(f"Error while searching Gmail approval link: {ascii_error(e)}")
+        return f"Error fetching Gmail emails: {ascii_error(e)}"
+    finally:
+        try:
+            mail.logout()
+        except Exception:
+            pass
+
+
+@retry_on_error
+def fetch_email_with_code(account, subject_keywords, code_length=None):
+    cache_tag = f"code_{code_length or 'general'}"
+    cached = get_cached_result(account, cache_tag)
+    if cached:
+        return cached
+
+    if not retry_gmail_connection():
+        return "تعذر الاتصال بـ Gmail. تأكد من GMAIL_EMAIL و GMAIL_APP_PASSWORD."
+    try:
+        safe_print(f"Searching code (len={code_length}) for account: {account}")
+        for mail_id in search_gmail_messages(account, subject_keywords):
+            msg = fetch_gmail_message(mail_id)
+            if not msg:
+                continue
+
+            subject = decode_mime_header(msg.get("Subject", ""))
+            if not subject_has_keyword(subject, subject_keywords):
+                continue
+
             body_text = extract_message_text_plain(msg)
             if not message_matches_account(account, msg, body_text):
                 safe_print("Subject matched but account mismatch")
                 continue
 
-            code = extract_verification_code(body_text)
+            code = extract_code_from_body(body_text, code_length)
             if code:
+                set_cached_result(account, cache_tag, code)
                 return code
         return "طلبك غير موجود."
     except Exception as e:
@@ -547,35 +732,132 @@ def fetch_email_with_code(account, subject_keywords):
         except Exception:
             pass
 
+
 # ----------------------------------
 # دالة لمعالجة الطلبات (Thread)
 # ----------------------------------
 def handle_request_async(chat_id, account, message_text):
-    if message_text == 'طلب رابط تحديث السكن':
-        response = fetch_email_with_link(account, ["تحديث السكن"], "نعم، أنا قدمت الطلب")
-    elif message_text == 'طلب رمز السكن':
-        response = fetch_email_with_link(account, ["رمز الوصول المؤقت"], "الحصول على الرمز")
-    elif message_text == 'طلب استعادة كلمة المرور':
-        response = fetch_email_with_link(account, ["إعادة تعيين كلمة المرور"], "إعادة تعيين كلمة المرور")
-    elif message_text == 'طلب رمز تسجيل الدخول':
-        response = fetch_email_with_code(account, ["رمز تسجيل الدخول", "login code", "sign in code", "sign-in code"])
-    elif message_text == 'طلب رمز التأكيد':
-        response = fetch_email_with_code(account, [
-            "رمز التحقق",
-            "رمز التأكيد",
-            "verification code",
-            "confirmation code",
-            "sign-in code",
-            "sign in code",
-            "netflix verification",
-            "تنتهي صلاحيته",
-        ])
-    elif message_text == 'طلب رابط عضويتك معلقة':
-        response = fetch_email_with_link(account, ["عضويتك في Netflix معلّقة"], "إضافة معلومات الدفع")
-    else:
-        response = "ليس لديك صلاحية لتنفيذ هذا الطلب."
+    response = None
+    try:
+        if message_text == 'طلب رابط تحديث السكن':
+            response = fetch_email_with_link(
+                account,
+                ["تحديث السكن", "household", "primary location"],
+                ["نعم، أنا قدمت الطلب", "Yes, this was me", "تحديث السكن", "Update Household", "confirm"]
+            )
+        elif message_text == 'طلب رمز السكن':
+            response = fetch_email_with_link(
+                account,
+                ["رمز الوصول المؤقت", "temporary access", "household", "رمز الوصول"],
+                ["الحصول على الرمز", "Get Code", "احصل على الرمز", "رمز الوصول"]
+            )
+        elif message_text == 'طلب استعادة كلمة المرور':
+            response = fetch_email_with_link(
+                account,
+                ["إعادة تعيين كلمة المرور", "password reset", "reset your password"],
+                ["إعادة تعيين كلمة المرور", "Reset Password"]
+            )
+        elif message_text == 'طلب رمز تسجيل الدخول':
+            response = fetch_email_with_code(
+                account,
+                ["رمز تسجيل الدخول", "sign-in code", "sign in code", "login code"],
+                code_length=4
+            )
+        elif message_text in ('طلب رمز التحقق', 'طلب رمز التأكيد'):
+            response = fetch_email_with_code(
+                account,
+                [
+                    "رمز التحقق",
+                    "رمز التأكيد",
+                    "verification code",
+                    "confirmation code",
+                    "verify your account",
+                    "netflix verification",
+                    "تنتهي صلاحيته"
+                ],
+                code_length=6
+            )
+        elif message_text in ('طلب الموافقة على تسجيل الدخول', 'طلب الموافقة', 'طلب رابط الموافقة على الدخول'):
+            response = fetch_email_approval_link(account)
+        elif message_text == 'طلب رابط عضويتك معلقة':
+            response = fetch_email_with_link(
+                account,
+                ["عضويتك في Netflix معلّقة", "معلّقة", "membership on hold", "membership paused"],
+                ["إضافة معلومات الدفع", "Update payment", "إعادة تفعيل العضوية", "Restart Membership"]
+            )
+        else:
+            response = "ليس لديك صلاحية لتنفيذ هذا الطلب."
+    except Exception as e:
+        safe_print(f"Error handling request {message_text}: {ascii_error(e)}")
+        response = f"حدث خطأ أثناء معالجة الطلب: {e}"
 
-    bot.send_message(chat_id, response)
+    if not response:
+        response = "لم يتم العثور على نتيجة لهذا الطلب."
+
+    send_formatted_response(chat_id, message_text, response)
+
+
+def send_formatted_response(chat_id, request_type, response):
+    if not response or response == "طلبك غير موجود.":
+        if "الموافقة" in request_type:
+            bot.send_message(
+                chat_id,
+                "❌ لم يتم العثور على رسالة طلب الموافقة.\n"
+                "يرجى التأكد من إرسال الطلب من الشاشة أو الجهاز أولاً."
+            )
+        elif "التحقق" in request_type or "التأكيد" in request_type:
+            bot.send_message(
+                chat_id,
+                "❌ لم يتم العثور على رمز التحقق.\n"
+                "يرجى التأكد من طلب الرمز من Netflix أولاً."
+            )
+        elif "تسجيل الدخول" in request_type:
+            bot.send_message(
+                chat_id,
+                "❌ لم يتم العثور على رمز تسجيل الدخول.\n"
+                "يرجى التأكد من طلب الرمز من Netflix أولاً."
+            )
+        else:
+            bot.send_message(chat_id, "❌ طلبك غير موجود. يرجى التأكد من إرسال الطلب أولاً.")
+        return
+
+    if str(response).startswith("Error") or "تعذر الاتصال" in str(response):
+        bot.send_message(chat_id, f"⚠️ {response}")
+        return
+
+    # إذا كانت النتيجة رابطاً
+    if isinstance(response, str) and (response.startswith("http://") or response.startswith("https://")):
+        markup = types.InlineKeyboardMarkup()
+        btn_text = "🔗 فتح الرابط"
+        if "الموافقة" in request_type:
+            btn_text = "🔗 اضغط هنا للموافقة على تسجيل الدخول"
+        elif "تحديث السكن" in request_type:
+            btn_text = "🔗 فتح رابط تحديث السكن"
+        elif "استعادة كلمة المرور" in request_type:
+            btn_text = "🔗 فتح رابط استعادة كلمة المرور"
+        elif "رمز السكن" in request_type:
+            btn_text = "🔗 الحصول على الرمز"
+        elif "عضويتك معلقة" in request_type:
+            btn_text = "🔗 فتح رابط الدفع والتفعيل"
+
+        markup.add(types.InlineKeyboardButton(text=btn_text, url=response))
+        bot.send_message(
+            chat_id,
+            f"✅ تم جلب الرابط بنجاح:\n\n{response}\n\n👆 اضغط على الزر أدناه لفتح الرابط مباشرة:",
+            reply_markup=markup
+        )
+        return
+
+    # إذا كانت النتيجة كود أرقام
+    if isinstance(response, str) and response.isdigit():
+        bot.send_message(
+            chat_id,
+            f"✅ رمزك هو:\n\n`{response}`\n\n(اضغط على الرمز لنسخه)",
+            parse_mode="Markdown"
+        )
+        return
+
+    bot.send_message(chat_id, str(response))
 
 # ----------------------------------
 # /start
@@ -606,22 +888,24 @@ def process_account_name(message):
     if (account_name in user_allowed_accounts) or is_admin(user_name):
         user_accounts[user_name] = account_name
 
-        markup = types.ReplyKeyboardMarkup(row_width=1)
+        markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
         # أزرار عامة للمستخدم العادي والأدمن
         btns = [
-            types.KeyboardButton('طلب رابط تحديث السكن'),
+            types.KeyboardButton('طلب رمز تسجيل الدخول'),
+            types.KeyboardButton('طلب رمز التحقق'),
+            types.KeyboardButton('طلب الموافقة على تسجيل الدخول'),
             types.KeyboardButton('طلب رمز السكن'),
-            types.KeyboardButton('طلب رمز التأكيد'),
+            types.KeyboardButton('طلب رابط تحديث السكن'),
             types.KeyboardButton('طلب استعادة كلمة المرور'),
+            types.KeyboardButton('طلب رابط عضويتك معلقة'),
             types.KeyboardButton('عرض الحسابات المرتبطة بي'),
+            types.KeyboardButton('تغيير الحساب'),
             # زر شراء حسابات (يطلب موافقة الأدمن)
             types.KeyboardButton('شراء حسابات للبيع')
         ]
         # الأزرار الإضافية للأدمن
         if is_admin(user_name):
             btns.extend([
-                types.KeyboardButton('طلب رمز تسجيل الدخول'),
-                types.KeyboardButton('طلب رابط عضويتك معلقة'),
                 types.KeyboardButton('إضافة حسابات للبيع'),
                 types.KeyboardButton('عرض الحسابات للبيع'),
                 types.KeyboardButton('حذف حسابات من المعروضة للبيع'),
@@ -647,6 +931,10 @@ def process_account_name(message):
     'طلب رابط تحديث السكن',
     'طلب رمز السكن',
     'طلب رمز التأكيد',
+    'طلب رمز التحقق',
+    'طلب الموافقة على تسجيل الدخول',
+    'طلب الموافقة',
+    'طلب رابط الموافقة على الدخول',
     'طلب استعادة كلمة المرور',
     'طلب رمز تسجيل الدخول',
     'طلب رابط عضويتك معلقة'
@@ -655,12 +943,17 @@ def handle_requests(message):
     user_name = clean_text(message.from_user.username)
     account = user_accounts.get(user_name)
     if not account:
-        bot.send_message(message.chat.id, "لم يتم تحديد حساب بعد.")
+        bot.send_message(message.chat.id, "لم يتم تحديد حساب بعد. أرسل /start لتحديد الحساب.")
         return
 
     bot.send_message(message.chat.id, "جاري الطلب...")
     thread = threading.Thread(target=handle_request_async, args=(message.chat.id, account, message.text))
     thread.start()
+
+@bot.message_handler(func=lambda message: message.text in ['تغيير الحساب', '/change_account'])
+def change_account_handler(message):
+    bot.send_message(message.chat.id, "يرجى إدخال اسم الحساب الجديد الذي ترغب في العمل عليه:")
+    bot.register_next_step_handler(message, process_account_name)
 
 @bot.message_handler(func=lambda message: message.text == 'عرض الحسابات المرتبطة بي')
 def show_user_accounts(message):
